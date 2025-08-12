@@ -1,0 +1,29 @@
+# Virtual Environment
+venv/
+.venv/
+MrB/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# IDE / Editor specific
+.idea/
+.vscode/
+.DS_Store
+
+# Local environment variables
+.env
+.env.*
+!/.env.example
+firebase-credentials.json
+
+# Log files
+*.log
