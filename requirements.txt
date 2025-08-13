@@ -3,3 +3,14 @@ uvicorn[standard]
 gunicorn
 firebase-admin
 pydantic-settings
+# Google Cloud / Vertex AI & Search
+google-cloud-aiplatform
+google-cloud-discoveryengine
+# 이미지 처리
+Pillow
+# 벡터/임베딩 인덱스
+faiss-cpu
+numpy
+# 고성능 JSON 직렬화 (선택)
+orjson
+python-multipart
