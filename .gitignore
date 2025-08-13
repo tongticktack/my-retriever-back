@@ -27,3 +27,12 @@ firebase-credentials.json
 
 # Log files
 *.log
+
+# FAISS indices & runtime data
+data/
+*.index
+meta.json
+
+# Cache / temp
+*.tmp
+*.swp

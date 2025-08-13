@@ -4,9 +4,18 @@ from typing import Optional
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env.local", env_file_encoding="utf-8", extra="ignore")
 
-    # 로컬 개발 시 .env.local 파일에서 경로를 읽어옵니다. (Docker 환경에서는 사용되지 않을 수 있음)
+    # Firebase
     GOOGLE_APPLICATION_CREDENTIALS: Optional[str] = None
-    # Docker 환경에서 환경 변수로 직접 주입될 JSON 문자열
     FIREBASE_CREDENTIALS_JSON_STRING: Optional[str] = None
+
+    # GCP / Vertex AI
+    GCP_PROJECT_ID: Optional[str] = None
+    VERTEX_LOCATION: str = "asia-northeast3-a"  # 기본 리전
+    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"  # 기본 모델
+    VERTEX_SEARCH_DATA_STORE_ID: Optional[str] = None  # Vertex AI Search Data Store ID
+
+    # 기능 플래그
+    ENABLE_VERTEX_SEARCH: bool = True
+    ENABLE_GEMINI: bool = True
 
 settings = Settings()
