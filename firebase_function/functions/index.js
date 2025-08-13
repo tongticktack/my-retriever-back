@@ -26,9 +26,9 @@ exports.collectPoliceData = functions
   .https.onRequest(async (req, res) => {
     try {
 
-      const today = new Date(new Date().getTime()); //ms로 현재 시각 받아와서 날짜 객체 생성
+      const today = new Date(new Date().getTime()); 
       const yesterday = new Date(today);
-      yesterday.setDate(today.getDate() - 1);
+      yesterday.setDate(today.getDate() - 1);//ms로 현재 시각 받아와서 날짜 객체 생성 및 어제로 시간 변경
       
       const yesterdayStr = getFormattedDate(yesterday); //기존에 만든 날짜 -> YYYYMMDD 형식 변환
 
@@ -36,7 +36,7 @@ exports.collectPoliceData = functions
       
       const processApiCall = async (apiUrl, apiName) => {
         try {
-          console.log(`ℹ️ [START] ${apiName} API 호출을 시작합니다...`);
+          console.log(`ℹ️ [START] ${apiName} API 호출을 시작`);
           
           const response = await axios.get(apiUrl, { 
               params: { serviceKey: SERVICE_KEY, 
@@ -55,7 +55,7 @@ exports.collectPoliceData = functions
             const errorHeader = responseNode?.header;
             const errorCode = errorHeader?.resultCode || 'N/A';
             const errorMsg = errorHeader?.resultMsg || '알 수 없는 오류';
-            console.error(`🚨 ${apiName} API가 오류를 반환했습니다. 코드: ${errorCode}, 메시지: ${errorMsg}`);
+            console.error(`🚨 ${apiName} API 오류 반환. 코드: ${errorCode}, 메시지: ${errorMsg}`);
             return;
           }//api에서 오류 검출 시 반환
 
@@ -68,11 +68,11 @@ exports.collectPoliceData = functions
         }
       };//api 호출 및 push 함수
 
-      await processApiCall(API_URL_police, "첫 번째 (Losfund)");
-      await processApiCall(API_URL_portal, "두 번째 (LosPtfund)");//api 분리 호출
+      await processApiCall(API_URL_police, "경찰청");
+      await processApiCall(API_URL_portal, "포털기관");//api 분리 호출
 
       if (combinedItems.length === 0) {
-        return res.status(200).send("모든 API에서 저장할 새로운 데이터가 없습니다. 로그를 확인하세요.");
+        return res.status(200).send("모든 API에서 저장할 새로운 데이터가 없음. 로그 확인 필요.");
       }
       
       const uniqueItems = new Map();
@@ -83,7 +83,7 @@ exports.collectPoliceData = functions
       
       const db = admin.firestore();
       const batch = db.batch();
-      const collectionRef = db.collection("PoliceLostItem"); //해당 컬렉션에 저장
+      const collectionRef = db.collection("PoliceLostItem"); //PoliceLostItem 컬렉션에 저장
       
       finalItemList.forEach(item => {
         const docRef = collectionRef.doc(item.atcId);
@@ -106,7 +106,7 @@ exports.collectPoliceData = functions
       
       await batch.commit();
       
-      const successMessage = `✅ 성공! 최종적으로 ${finalItemList.length}건의 데이터를 Firestore에 저장했습니다.`;
+      const successMessage = `✅ 성공 최종 ${finalItemList.length}건 데이터 Firestore에 저장`;
       console.log(successMessage);
       res.status(200).send(successMessage);
       
