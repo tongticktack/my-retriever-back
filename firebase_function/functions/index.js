@@ -13,30 +13,24 @@ const runtimeOpts = {
   memory: "256MB",
 }; //서버 응답 대기 시간 3분
 
-// const getFormattedDate = (date) => {
-//   const year = date.getFullYear();
-//   const month = String(date.getMonth() + 1).padStart(2, '0');
-//   const day = String(date.getDate()).padStart(2, '0');
-//   return `${year}${month}${day}`;
-// }; //YYYYMMDD 형식으로 날짜를 입력받기 때문에 스케줄러 기능을 위한 날짜 변환 형식
+const getFormattedDate = (date) => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}${month}${day}`;
+}; //YYYYMMDD 형식으로 날짜를 입력받기 때문에 스케줄러 기능을 위한 날짜 변환 형식
 
 exports.collectPoliceData = functions
   .region("asia-northeast3")
   .runWith(runtimeOpts)
   .https.onRequest(async (req, res) => {
     try {
-    //   let startDate = req.query.startDate;
-    //   let endDate = req.query.endDate;
+
+      const today = new Date(new Date().getTime()); //ms로 현재 시각 받아와서 날짜 객체 생성
+      const yesterday = new Date(today);
+      yesterday.setDate(today.getDate() - 1);
       
-    //   if (!startDate || !endDate) {
-    //     const today = new Date(new Date().getTime() * 60 * 60 * 1000); //ms로 현재 시각 받아와서 날짜 객체 생성
-    //     const todayStr = getFormattedDate(today); //기존에 만든 날짜 -> YYYYMMDD 형식 변환
-    //     startDate = todayStr;
-    //     endDate = todayStr;
-    //     console.log(`날짜 파라미터가 없습니다. 오늘 날짜(${todayStr})로 설정합니다.`);
-    //   } else {
-    //     console.log(`지정된 날짜(${startDate} ~ ${endDate})로 데이터를 검색합니다.`);
-    //   }
+      const yesterdayStr = getFormattedDate(yesterday); //기존에 만든 날짜 -> YYYYMMDD 형식 변환
 
       const combinedItems = [];
       
@@ -45,10 +39,14 @@ exports.collectPoliceData = functions
           console.log(`ℹ️ [START] ${apiName} API 호출을 시작합니다...`);
           
           const response = await axios.get(apiUrl, { 
-              params: { serviceKey: SERVICE_KEY, endDate: "20250801", numOfRows: "1000", _type: "json" }, //25년 7월부터 포털 1000개, 경찰청 1000개 데이터 받아와서 db화
+              params: { serviceKey: SERVICE_KEY, 
+                START_YMD: yesterdayStr, 
+                END_YMD: yesterdayStr, // "YYYYMMDD" 형식으로 기간 설정
+                numOfRows: "50", //데일리로 전날 n개 데이터 db화
+                _type: "json" }, 
               timeout: 60000,//타임아웃 1분
               responseType: 'json', //처음 들어오는 문자가 "<"이 아닌 "{"로 xml타입이 아니라 json 파일로 보내주는 것을 확인하고 응답 타입 변경함
-          });
+          }); //파라미터 전달
           
           const result = response.data;
           const responseNode = result.response;
