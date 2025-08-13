@@ -84,3 +84,27 @@ docker run -d -p 8000:8000 \
 - `-p 8000:8000`: 호스트의 8000번 포트를 컨테이너의 8000번 포트와 매핑합니다.
 - `-e ...`: 컨테이너 내부에 환경 변수를 설정합니다. `cat` 명령어로 `firebase-credentials.json` 파일의 내용을 통째로 읽어 주입합니다.
 - `--name`: 컨테이너에 `my-retriever-app`이라는 이름을 부여합니다.
+
+공공데이터 api -> firestore
+
+Firebase CLI 로그인:
+
+  터미널에서 명령어를 실행, 웹 브라우저에서 본인의 Google 계정으로 로그인
+
+    firebase login
+
+Firebase 프로젝트 연결 확인:
+
+  프로젝트에 정상적으로 접근 가능한지 확인
+
+    firebase projects:list
+
+      firebase 프로젝트 권한을 드려서 myretriver-c5fdd 프로젝트가 있어야 합니다.
+
+필요한 라이브러리 설치:
+
+  데이터 수집기(firebase_function/functions)에 필요한 라이브러리를 설치
+
+    cd firebase_function/functions
+
+      npm install
