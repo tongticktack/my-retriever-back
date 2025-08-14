@@ -50,6 +50,48 @@ uvicorn main:app --reload
 
 서버가 실행되면 브라우저에서 `http://127.0.0.1:8000` 주소로 접속하여 API 문서를 확인할 수 있습니다. (`/docs`)
 
+## LLM / Gemini 설정
+
+환경 변수로 LLM 제공자를 제어합니다.
+
+필드:
+
+| 변수 | 설명 | 기본값 |
+|------|------|--------|
+| `LLM_PROVIDER` | 사용 LLM: `echo`, `gemini`, `openai`, `auto` | `auto` |
+| `LLM_AUTO_PRIORITY` | auto 모드 체인 우선순위 (콤마 구분) | `gemini,openai,echo` |
+| `GEMINI_API_KEY` | AI Studio 발급 키 (존재 시 Gemini 활성) | (없음) |
+| `GEMINI_MODEL_NAME` | Gemini 모델명 | `gemini-2.0-flash` |
+| `OPENAI_MODEL_NAME` | OpenAI Chat 모델명 | `gpt-4o-mini` |
+| `LLM_MAX_HISTORY_MESSAGES` | 유지할 대화 히스토리 길이 (system 제외) | `20` |
+
+auto 모드 동작:
+1. `LLM_AUTO_PRIORITY` 순서대로 provider 초기화 & 호출을 시도합니다.
+2. 각 provider 가 정상 응답(status == ok)하면 체인을 즉시 종료합니다.
+3. 실패(예외) 또는 provider 내부 fallback(status != ok) 시 다음 provider 로 진행합니다.
+4. `echo` 는 항상 최종 안전망으로 보장됩니다.
+
+예시 (.env.local):
+
+```env
+LLM_PROVIDER=auto
+LLM_AUTO_PRIORITY=gemini,openai,echo
+GEMINI_API_KEY=your_ai_studio_key
+GEMINI_MODEL_NAME=gemini-2.0-flash
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL_NAME=gpt-4o-mini
+```
+
+OpenAI 를 1순위로 바꾸고 싶다면:
+
+```env
+LLM_AUTO_PRIORITY=openai,gemini,echo
+```
+
+Gemini 를 비활성화하려면:
+
+Gemini 비활성화: `GEMINI_API_KEY` 값을 제거하거나 비워두면 체인에서 자동 제외됩니다.
+
 ## 배포 (Deployment)
 
 ### Docker를 사용한 배포

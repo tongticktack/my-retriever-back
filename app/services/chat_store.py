@@ -1,4 +1,4 @@
-from typing import List, Dict
+from typing import List, Dict, Optional
 from datetime import datetime, timezone
 import uuid
 
@@ -28,7 +28,7 @@ def create_session() -> str:
     return session_id
 
 
-def add_message(session_id: str, role: str, content: str) -> str:
+def add_message(session_id: str, role: str, content: str, meta: Optional[Dict] = None) -> str:
     """
     Add a message to a chat session with:
     - Content validation (1..1000 chars after trim)
@@ -49,20 +49,27 @@ def add_message(session_id: str, role: str, content: str) -> str:
     session_ref = db.collection("chat_sessions").document(session_id)
     msg_ref = session_ref.collection("messages").document(msg_id)
 
-    def txn_op(transaction):
-        snap = transaction.get(session_ref)
-        if not snap.exists:
-            raise ValueError("session_not_found")
-        # Prepare server timestamp sentinel
-        server_ts = firestore.SERVER_TIMESTAMP
-        transaction.set(msg_ref, {
-            "role": role,
-            "content": trimmed,
-            "created_at": server_ts,  # Firestore Timestamp
-        })
-        transaction.update(session_ref, {"last_active_at": server_ts})
+    # 세션 존재 확인 (단순 조회)
+    snap = session_ref.get()
+    if not snap.exists:
+        raise ValueError("session_not_found")
 
-    db.transaction()(txn_op)  # Execute transaction
+    server_ts = firestore.SERVER_TIMESTAMP
+    # 메시지 작성
+    payload = {
+        "role": role,
+        "content": trimmed,
+        "created_at": server_ts,
+    }
+    if meta:
+        # Flatten simple meta keys (e.g., model)
+        for k, v in meta.items():
+            # Avoid overwriting core keys
+            if k not in payload:
+                payload[k] = v
+    msg_ref.set(payload)
+    # 마지막 활동 시각 업데이트 (트랜잭션 필요성 낮음)
+    session_ref.update({"last_active_at": server_ts})
     return msg_id
 
 
@@ -88,5 +95,6 @@ def fetch_messages(session_id: str, limit: int = 50) -> List[Dict]:
             "role": data.get("role"),
             "content": data.get("content"),
             "created_at": created_str,
+            "model": data.get("model"),
         })
     return list(reversed(messages))

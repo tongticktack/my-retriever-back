@@ -15,13 +15,20 @@ DATA_DIR.mkdir(exist_ok=True)
 IMAGE_INDEX_PATH = DATA_DIR / "image.index"
 TEXT_INDEX_PATH = DATA_DIR / "text.index"
 META_PATH = DATA_DIR / "meta.json"
+IDMAP_IMAGE_PATH = DATA_DIR / "idmap_image.json"
+IDMAP_TEXT_PATH = DATA_DIR / "idmap_text.json"
 
 INDEX_LOCK = threading.RLock()
 META: Dict[str, dict] = {}
+IDMAP_IMAGE: List[str] = []  # position -> item_id
+IDMAP_TEXT: List[str] = []
 
-EMBED_DIM_IMAGE = 512  # placeholder dimension
-EMBED_DIM_TEXT = 768   # placeholder dimension
-EMBEDDING_VERSION = "v0"
+from config import settings
+from . import embeddings
+
+EMBED_DIM_IMAGE = settings.EMBEDDING_DIM_IMAGE
+EMBED_DIM_TEXT = settings.EMBEDDING_DIM_TEXT
+EMBEDDING_VERSION = settings.EMBEDDING_VERSION
 
 
 def _create_flat_index(dim: int):
@@ -42,14 +49,13 @@ def _load_index(path: Path, dim: int):
 
 
 def load_all():
-    global IMAGE_INDEX, TEXT_INDEX, META
+    global IMAGE_INDEX, TEXT_INDEX, META, IDMAP_IMAGE, IDMAP_TEXT
     with INDEX_LOCK:
         IMAGE_INDEX = _load_index(IMAGE_INDEX_PATH, EMBED_DIM_IMAGE)
         TEXT_INDEX = _load_index(TEXT_INDEX_PATH, EMBED_DIM_TEXT)
-        if META_PATH.exists():
-            META = json.loads(META_PATH.read_text("utf-8"))
-        else:
-            META = {}
+    META = json.loads(META_PATH.read_text("utf-8")) if META_PATH.exists() else {}
+    IDMAP_IMAGE = json.loads(IDMAP_IMAGE_PATH.read_text("utf-8")) if IDMAP_IMAGE_PATH.exists() else []
+    IDMAP_TEXT = json.loads(IDMAP_TEXT_PATH.read_text("utf-8")) if IDMAP_TEXT_PATH.exists() else []
 
 
 def save_all():
@@ -57,6 +63,8 @@ def save_all():
         _save_index(IMAGE_INDEX, IMAGE_INDEX_PATH)
         _save_index(TEXT_INDEX, TEXT_INDEX_PATH)
         META_PATH.write_text(json.dumps(META, ensure_ascii=False, indent=2), "utf-8")
+        IDMAP_IMAGE_PATH.write_text(json.dumps(IDMAP_IMAGE, ensure_ascii=False, indent=2), "utf-8")
+        IDMAP_TEXT_PATH.write_text(json.dumps(IDMAP_TEXT, ensure_ascii=False, indent=2), "utf-8")
 
 
 def add_item(item_id: str, image_vec, text_vec, meta: dict):
@@ -66,9 +74,11 @@ def add_item(item_id: str, image_vec, text_vec, meta: dict):
         if image_vec is not None:
             image_arr = np.array([image_vec], dtype='float32')
             IMAGE_INDEX.add(image_arr)
+            IDMAP_IMAGE.append(item_id)
         if text_vec is not None:
             text_arr = np.array([text_vec], dtype='float32')
             TEXT_INDEX.add(text_arr)
+            IDMAP_TEXT.append(item_id)
         META[item_id] = meta
 
 
@@ -83,11 +93,60 @@ def search_image(query_vec, k=5) -> List[Tuple[str, float, dict]]:
         for score, idx in zip(scores[0], idxs[0]):
             if idx == -1:
                 continue
-            # FAISS FlatIP 는 id 매핑 없으므로 META 저장 시 순서 기반 별도 매핑 필요 (추후 개선)
-            # 지금은 단순히 META keys 순서로 매핑 (MVP) → 안정 위해 별도 ID->position 맵 권장
-            item_id = list(META.keys())[idx]
+            if idx >= len(IDMAP_IMAGE):
+                continue
+            item_id = IDMAP_IMAGE[idx]
             results.append((item_id, float(score), META[item_id]))
         return results
+
+
+def search_text(query_vec, k=5) -> List[Tuple[str, float, dict]]:
+    import numpy as np
+    with INDEX_LOCK:
+        if TEXT_INDEX.ntotal == 0:
+            return []
+        q = np.array([query_vec], dtype='float32')
+        scores, idxs = TEXT_INDEX.search(q, k)
+        results = []
+        for score, idx in zip(scores[0], idxs[0]):
+            if idx == -1:
+                continue
+            if idx >= len(IDMAP_TEXT):
+                continue
+            item_id = IDMAP_TEXT[idx]
+            results.append((item_id, float(score), META[item_id]))
+        return results
+
+
+def needs_reindex(current_version: str, provider: str) -> bool:
+    return current_version != settings.EMBEDDING_VERSION or provider != settings.EMBEDDING_PROVIDER
+
+
+def reindex_all(force: bool = False):
+    """Rebuild indices from META if version/provider mismatch or force.
+    WARNING: Assumes original image/text not stored; only caption used for text, image skipped if path not available.
+    """
+    import numpy as np
+    if not force and not any(
+        needs_reindex(m.get('embedding_version',''), m.get('embedding_provider','hash'))
+        for m in META.values()
+    ):
+        return False
+    # Recreate indices
+    global IMAGE_INDEX, TEXT_INDEX, IDMAP_IMAGE, IDMAP_TEXT
+    IMAGE_INDEX = _create_flat_index(EMBED_DIM_IMAGE)
+    TEXT_INDEX = _create_flat_index(EMBED_DIM_TEXT)
+    IDMAP_IMAGE = []
+    IDMAP_TEXT = []
+    for item_id, meta in META.items():
+        caption = meta.get('caption','')
+        text_vec = None
+        if caption:
+            text_vec = embeddings.embed_text(caption)
+        # Cannot regenerate image embedding without raw image; skip image_vec
+        add_item(item_id, image_vec=None, text_vec=text_vec, meta={**meta, 'embedding_version': settings.EMBEDDING_VERSION, 'embedding_provider': settings.EMBEDDING_PROVIDER})
+    save_all()
+    return True
 
 # 모듈 import 시 자동 로드 시도
 try:

@@ -1,6 +1,6 @@
 import firebase_admin
 import json
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from firebase_admin import credentials
 
 from config import settings
@@ -19,6 +19,20 @@ else:
     print("WARNING: Firebase credentials not found. Firebase features will be disabled.")
 
 app = FastAPI(title="Loosy Lost & Found API")
+
+# Simple structured logging middleware (can be replaced by proper logger)
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    from time import time
+    start = time()
+    path = request.url.path
+    method = request.method
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        duration = (time() - start) * 1000
+        print(f"[req] {method} {path} {duration:.1f}ms")
 
 try:
     from fastapi.middleware.cors import CORSMiddleware
@@ -39,9 +53,18 @@ except Exception as e:
 
 # Routers
 from app.api import items, chat
+from app.services import faiss_index
 app.include_router(items.router)
 app.include_router(chat.router)
+
 
 @app.get("/")
 def root():
     return {"message": "Loosy backend modular 구조 준비", "routes": ["/items/ingest", "/items/search/image", "/chat/session", "/chat/send", "/chat/history/{session_id}"]}
+
+
+@app.post("/admin/reindex")
+def admin_reindex(force: bool = False):
+    changed = faiss_index.reindex_all(force=force)
+    return {"reindexed": changed, "embedding_version": faiss_index.EMBEDDING_VERSION}
+

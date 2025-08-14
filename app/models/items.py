@@ -17,6 +17,7 @@ class LostItemMeta(BaseModel):
     notes: Optional[str] = None
     image_path: Optional[str] = None
     embedding_version: Optional[str] = None
+    embedding_provider: Optional[str] = None
     created_at: datetime
 
 class SearchResult(BaseModel):
