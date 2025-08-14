@@ -179,8 +179,8 @@ exports.collectPoliceData = functions
           itemName: item.fdPrdtNm || null, //이름
           itemCategory: item.prdtClNm || null, //카테고리 대분류 > 상세분류
           foundDate: item.fdYmd || null, //습득일자
-          foundPlace:null, //습득장소는 null처리, 이후 크롤링 기능 개발 시 해당 필드에 삽입
           storagePlace: item.depPlace || null, //보관장소
+          location: null, //포털기관 좌표 받아서 저장할 예정
           createdAt: admin.firestore.FieldValue.serverTimestamp(),//db화된 작업 시간 확인
         };
 
