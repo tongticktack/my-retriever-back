@@ -61,6 +61,12 @@ def build_messages(session_id: str, user_input: str, retrieval_items: Optional[L
         if h.get("role") in {"user", "assistant"}:
             msgs.append({"role": h["role"], "content": h.get("content", "")})
 
-    # Current user input
-    msgs.append({"role": "user", "content": user_input})
+    # Current user input (avoid duplicating if last history message already equals this user turn)
+    last_non_system = None
+    for m in reversed(msgs):
+        if m["role"] != "system":
+            last_non_system = m
+            break
+    if not (last_non_system and last_non_system.get("role") == "user" and last_non_system.get("content") == user_input):
+        msgs.append({"role": "user", "content": user_input})
     return msgs
