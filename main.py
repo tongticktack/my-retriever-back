@@ -20,8 +20,25 @@ else:
 
 app = FastAPI(title="Loosy Lost & Found API")
 
+try:
+    from fastapi.middleware.cors import CORSMiddleware
+    allowed_origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://localhost:3000",
+    ]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+except Exception as e:
+    print("WARNING: CORS middleware not added:", e)
+
 # Routers
-from app.api import items, chat  # noqa: E402
+from app.api import items, chat
 app.include_router(items.router)
 app.include_router(chat.router)
 
