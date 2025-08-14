@@ -34,19 +34,37 @@ def create_session():
 
 @router.post("/send", response_model=SendMessageResponse)
 def send_message(req: SendMessageRequest):
-    # 사용자 메시지 저장
+    # 사용자 메시지 저장 (유효성/트랜잭션 내부 처리)
     try:
-        msg_id = chat_store.add_message(req.session_id, "user", req.content)
-    except ValueError:
-        raise HTTPException(404, "session_not_found")
+        user_msg_id = chat_store.add_message(req.session_id, "user", req.content)
+    except ValueError as e:
+        code = str(e)
+        if code == "session_not_found":
+            raise HTTPException(status_code=404, detail=code)
+        if code == "empty_content":
+            raise HTTPException(status_code=400, detail=code)
+        if code == "content_too_long":
+            raise HTTPException(status_code=413, detail=code)
+        raise HTTPException(status_code=400, detail="invalid_request")
 
-    # TODO: Gemini 호출 후 assistant 메시지 생성 (현재 에코)
+    # TODO: Gemini 호출로 교체 (현재는 단순 에코)
     assistant_reply = f"(임시 응답) {req.content[:100]}"
     chat_store.add_message(req.session_id, "assistant", assistant_reply)
 
+    # 최신 히스토리 일부 가져와 user 메시지 timestamp 포함 (limit=2 충분)
+    try:
+        recent = chat_store.fetch_messages(req.session_id, limit=2)
+    except ValueError:
+        recent = []
+    created_at = ""
+    for m in reversed(recent):  # 보존 순서
+        if m.get("id") == user_msg_id:
+            created_at = m.get("created_at", "")
+            break
+
     return SendMessageResponse(
         session_id=req.session_id,
-        message=Message(id=msg_id, role="user", content=req.content, created_at=""),
+        message=Message(id=user_msg_id, role="user", content=req.content, created_at=created_at),
     )
 
 @router.get("/history/{session_id}", response_model=HistoryResponse)
