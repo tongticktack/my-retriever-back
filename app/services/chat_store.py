@@ -13,17 +13,21 @@ def get_db():
     return _db
 
 # Firestore 구조
-# chat_sessions/{session_id}  { created_at, last_active_at }
+# chat_sessions/{session_id}  { created_at, last_active_at, user_id, title }
 # chat_sessions/{session_id}/messages/{message_id}  { role, content, created_at }
 
 
-def create_session() -> str:
+def create_session(user_id: Optional[str] = None) -> str:
     db = get_db()
+    # guest 표준화: None/빈문자열 모두 'guest' 저장
+    norm_user_id = (user_id or '').strip() or 'guest'
     session_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
     db.collection("chat_sessions").document(session_id).set({
         "created_at": now.isoformat(),
         "last_active_at": now.isoformat(),
+        "user_id": norm_user_id,
+    "title": None,  # 첫 user 메시지 들어올 때 생성
     })
     return session_id
 
@@ -36,7 +40,7 @@ def add_message(session_id: str, role: str, content: str, meta: Optional[Dict] =
     - Server-side timestamp (prevents client/server clock drift)
 
     Raises ValueError with codes:
-      session_not_found | empty_content | content_too_long
+        session_not_found | empty_content | content_too_long
     """
     db = get_db()
     trimmed = content.strip() if content is not None else ""
@@ -62,14 +66,27 @@ def add_message(session_id: str, role: str, content: str, meta: Optional[Dict] =
         "created_at": server_ts,
     }
     if meta:
-        # Flatten simple meta keys (e.g., model)
         for k, v in meta.items():
-            # Avoid overwriting core keys
             if k not in payload:
                 payload[k] = v
     msg_ref.set(payload)
-    # 마지막 활동 시각 업데이트 (트랜잭션 필요성 낮음)
-    session_ref.update({"last_active_at": server_ts})
+    # 마지막 활동 시각 + (필요 시) 타이틀 업데이트
+    updates = {"last_active_at": server_ts}
+    # 첫 user 메시지일 때 title 설정
+    if role == "user":
+        try:
+            snap_after = session_ref.get()
+            data_after = snap_after.to_dict() or {}
+            if not data_after.get("title"):
+                # LLM 기반 타이틀 생성 시도 (실패하면 fallback)
+                from .title_generator import generate_session_title  # 지연 import
+                raw = trimmed.replace("\n", " ").strip()
+                title = generate_session_title(raw)
+                updates["title"] = title
+        except Exception:
+            # 실패 시 title 생략 (None 유지)
+            pass
+    session_ref.update(updates)
     return msg_id
 
 
@@ -98,3 +115,27 @@ def fetch_messages(session_id: str, limit: int = 50) -> List[Dict]:
             "model": data.get("model"),
         })
     return list(reversed(messages))
+
+
+def list_sessions(user_id: str, limit: int = 50) -> List[Dict]:
+    """사용자별 세션 목록 반환.
+
+    반환 필드: session_id, title (없으면 "(제목 없음)"), created_at, last_active_at
+    최근(last_active_at DESC) 순.
+    """
+    db = get_db()
+    # where + order_by 조합은 Firestore 인덱스 필요할 수 있음 (배포 시 콘솔에서 제안 수락)
+    q = (db.collection("chat_sessions")
+        .where("user_id", "==", user_id)
+        .order_by("last_active_at", direction=firestore.Query.DESCENDING)
+        .limit(limit))
+    sessions: List[Dict] = []
+    for doc in q.stream():
+        d = doc.to_dict() or {}
+        sessions.append({
+            "session_id": doc.id,
+            "title": d.get("title") or "(제목 없음)",
+            "created_at": d.get("created_at"),
+            "last_active_at": d.get("last_active_at"),
+        })
+    return sessions

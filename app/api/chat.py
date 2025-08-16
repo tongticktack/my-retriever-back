@@ -9,12 +9,17 @@ from config import settings
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
+class CreateSessionRequest(BaseModel):
+    user_id: Optional[str] = None
+
 class CreateSessionResponse(BaseModel):
     session_id: str
+    user_id: Optional[str] = None
 
 class SendMessageRequest(BaseModel):
     session_id: str
     content: str
+    user_id: Optional[str] = None  # (미인증 상태라 사용 안하지만 필드 예약)
 
 class Message(BaseModel):
     id: str
@@ -32,14 +37,22 @@ class HistoryResponse(BaseModel):
     session_id: str
     messages: List[Message]
 
+class SessionSummary(BaseModel):
+    session_id: str
+    title: str
+    created_at: Optional[str] = None
+    last_active_at: Optional[str] = None
+
+class SessionListResponse(BaseModel):
+    sessions: List[SessionSummary]
+
 @router.post("/session", response_model=CreateSessionResponse)
-def create_session():
-    session_id = chat_store.create_session()
-    return CreateSessionResponse(session_id=session_id)
+def create_session(req: CreateSessionRequest):
+    session_id = chat_store.create_session(user_id=req.user_id)
+    return CreateSessionResponse(session_id=session_id, user_id=req.user_id)
 
 @router.post("/send", response_model=SendMessageResponse)
 def send_message(req: SendMessageRequest):
-    # 사용자 메시지 저장 (유효성/트랜잭션 내부 처리)
     try:
         user_msg_id = chat_store.add_message(req.session_id, "user", req.content)
     except ValueError as e:
@@ -50,21 +63,17 @@ def send_message(req: SendMessageRequest):
             raise HTTPException(status_code=400, detail=code)
         if code == "content_too_long":
             raise HTTPException(status_code=413, detail=code)
-        # 미확인 코드 → 디버깅 도움 위해 raw 포함
         raise HTTPException(status_code=400, detail={"error": "invalid_request", "raw": code})
     except RuntimeError as e:
-        # 내부 Firestore 트랜잭션 실패
         raise HTTPException(status_code=500, detail=str(e))
 
     # LLM 호출
     llm = get_llm()
-    # Build full prompt messages (retrieval context placeholders currently None)
     provider_messages = build_messages(req.session_id, req.content, retrieval_items=None, law_summary=None)
     try:
         assistant_reply = llm.generate(provider_messages)
     except Exception as e:
         assistant_reply = f"(llm-error) {str(e)[:120]}"
-    # Determine model meta (auto provider may have last_model_name)
     chosen_model = getattr(llm, "last_model_name", None) or getattr(llm, "model", None) or getattr(llm, "name", "unknown")
     assistant_msg_id = chat_store.add_message(
         req.session_id,
@@ -110,3 +119,12 @@ def history(session_id: str, limit: int = 50):
         session_id=session_id,
         messages=[Message(**m) for m in msgs]
     )
+
+
+@router.get("/sessions", response_model=SessionListResponse)
+def list_sessions(user_id: str, limit: int = 50):
+    if not user_id:
+        raise HTTPException(400, "missing_user_id")
+    sessions_raw = chat_store.list_sessions(user_id=user_id, limit=limit)
+    summaries = [SessionSummary(**s) for s in sessions_raw]
+    return SessionListResponse(sessions=summaries)
