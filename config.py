@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     # Firebase
     GOOGLE_APPLICATION_CREDENTIALS: Optional[str] = None
     FIREBASE_CREDENTIALS_JSON_STRING: Optional[str] = None
+    FIREBASE_STORAGE_BUCKET: Optional[str] = None  # firebase storage bucket name (e.g. my-app.appspot.com)
 
     # Gemini (AI Studio)
     GEMINI_API_KEY: Optional[str] = None
@@ -33,7 +34,9 @@ class Settings(BaseSettings):
     EMBEDDING_VERSION: str = "v1"
     
     # prompt
-    PROMPT_VERSION: int = 1
-    SYSTEM_PROMPT_FILE: str = "app/prompts/system_prompt_v1.txt"
+    # Prompt bundle version (intent/extraction/guard). Set via env PROMPT_VERSION.
+    PROMPT_VERSION: int = 2
+    SYSTEM_PROMPT_FILE: str = "app/prompts/system_prompt_v2.txt"  # default to v2 identity-enhanced prompt
+
 
 settings = Settings()

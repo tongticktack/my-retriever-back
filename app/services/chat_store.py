@@ -20,7 +20,12 @@ def get_db():
 def create_session(user_id: Optional[str] = None) -> str:
     db = get_db()
     # guest 표준화: None/빈문자열 모두 'guest' 저장
-    norm_user_id = (user_id or '').strip() or 'guest'
+    norm_user_id = (user_id or '').strip()
+    # 쿼리스트링에서 실수로 "user_123" 형태로 올 때 양끝 쌍따옴표 제거
+    if norm_user_id.startswith('"') and norm_user_id.endswith('"') and len(norm_user_id) >= 2:
+        norm_user_id = norm_user_id[1:-1].strip()
+    if not norm_user_id:
+        norm_user_id = 'guest'
     session_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
     db.collection("chat_sessions").document(session_id).set({
@@ -30,6 +35,26 @@ def create_session(user_id: Optional[str] = None) -> str:
     "title": None,  # 첫 user 메시지 들어올 때 생성
     })
     return session_id
+
+
+def get_session_data(session_id: str) -> Optional[Dict]:
+    """Return session document dict or None."""
+    db = get_db()
+    ref = db.collection("chat_sessions").document(session_id)
+    snap = ref.get()
+    if not snap.exists:
+        return None
+    return snap.to_dict() or {}
+
+
+def update_session(session_id: str, data: Dict) -> None:
+    """Shallow update of session document (no merge into nested maps except Firestore default behavior)."""
+    db = get_db()
+    ref = db.collection("chat_sessions").document(session_id)
+    try:
+        ref.update(data)
+    except Exception:
+        pass
 
 
 def add_message(session_id: str, role: str, content: str, meta: Optional[Dict] = None) -> str:
@@ -113,6 +138,7 @@ def fetch_messages(session_id: str, limit: int = 50) -> List[Dict]:
             "content": data.get("content"),
             "created_at": created_str,
             "model": data.get("model"),
+            "attachments": data.get("attachments"),
         })
     return list(reversed(messages))
 
@@ -132,10 +158,49 @@ def list_sessions(user_id: str, limit: int = 50) -> List[Dict]:
     sessions: List[Dict] = []
     for doc in q.stream():
         d = doc.to_dict() or {}
+        created_raw = d.get("created_at")
+        last_raw = d.get("last_active_at")
+        if isinstance(created_raw, datetime):
+            created_str = created_raw.isoformat()
+        else:
+            created_str = str(created_raw) if created_raw is not None else ""
+        if isinstance(last_raw, datetime):
+            last_str = last_raw.isoformat()
+        else:
+            last_str = str(last_raw) if last_raw is not None else ""
         sessions.append({
             "session_id": doc.id,
             "title": d.get("title") or "(제목 없음)",
-            "created_at": d.get("created_at"),
-            "last_active_at": d.get("last_active_at"),
+            "created_at": created_str,
+            "last_active_at": last_str,
         })
     return sessions
+
+
+def delete_session(session_id: str) -> bool:
+    """세션 및 하위 메시지 삭제.
+
+    반환: True = 삭제됨, False = 존재하지 않음
+    Firestore 는 하위 컬렉션 자동 삭제 없으므로 수동 반복.
+    메시지 수 많을 수 있으니 배치로 처리 (최대 400/배치).
+    """
+    db = get_db()
+    session_ref = db.collection("chat_sessions").document(session_id)
+    snap = session_ref.get()
+    if not snap.exists:
+        return False
+    # 메시지 삭제
+    msgs_col = session_ref.collection("messages")
+    batch = db.batch()
+    count = 0
+    # stream 은 한 번에 모든 문서 반환 (대규모면 개선 필요)
+    for doc in msgs_col.stream():
+        batch.delete(doc.reference)
+        count += 1
+        if count % 400 == 0:
+            batch.commit()
+            batch = db.batch()
+    batch.commit()
+    # 세션 삭제
+    session_ref.delete()
+    return True
