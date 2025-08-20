@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, Response
+from fastapi import APIRouter, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from typing import List
 import hashlib
@@ -7,17 +7,16 @@ import io
 import time
 import uuid
 
-# NOTE: Simple in-memory store placeholder.
-# In production replace with cloud storage + persistent metadata (Firestore or DB).
-_MEDIA_STORE = {}
-USE_FIREBASE_STORAGE = False
+# Firebase Storage 전용 모드: 메모리 모드 제거
 try:
-    from config import settings
-    if settings.FIREBASE_STORAGE_BUCKET:
-        from app.services import media_store
-        USE_FIREBASE_STORAGE = True
-except Exception:
+    from app.services import media_store  # lazy import
+    media_store.get_bucket()
+    USE_FIREBASE_STORAGE = True
+    print("[media] Firebase storage 활성화")
+except Exception as e:
+    # 즉시 실패: 서비스 필수 구성 누락
     USE_FIREBASE_STORAGE = False
+    print(f"[media] FATAL: Firebase storage 사용 불가 - {e}")
 
 router = APIRouter(prefix="/media", tags=["media"])
 
@@ -46,7 +45,6 @@ class MediaMetaResponse(BaseModel):
 
 
 def _phash_bytes(data: bytes) -> str:
-    # Simple perceptual-ish hash: resize grayscale 16x16 and hash pixels
     try:
         img = Image.open(io.BytesIO(data)).convert("L").resize((16, 16))
         pixels = bytes(img.getdata())
@@ -76,78 +74,65 @@ def _dominant_palette(img: Image.Image, k: int = 3) -> List[str]:
 
 @router.post("/upload", response_model=MediaUploadResponse)
 async def upload_image(file: UploadFile = File(...)):
+    if not USE_FIREBASE_STORAGE:
+        raise HTTPException(500, detail="firebase_storage_not_configured")
     if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(415, detail="unsupported_type")
     raw = await file.read()
-    if len(raw) > MAX_BYTES:
+    size = len(raw)
+    if size > MAX_BYTES:
         raise HTTPException(413, detail="file_too_large")
-    if USE_FIREBASE_STORAGE:
-        try:
-            meta = media_store.upload_image(raw, file.content_type or "application/octet-stream")
-            return MediaUploadResponse(**{k: meta[k] for k in ["media_id","url","width","height","hash","palette","content_type"]})
-        except Exception as e:
-            raise HTTPException(500, detail=f"upload_error:{e}")
-    # fallback in-memory
-    ph = _phash_bytes(raw)
-    for mid, meta in _MEDIA_STORE.items():
-        if meta.get("hash") == ph:
-            return MediaUploadResponse(**meta)
+    print(f"[media.upload] name={file.filename} ct={file.content_type} bytes={size}")
     try:
-        img = Image.open(io.BytesIO(raw)); img.load()
-    except Exception:
-        raise HTTPException(400, detail="invalid_image")
-    width, height = img.size
-    palette = _dominant_palette(img)
-    media_id = str(uuid.uuid4())
-    _MEDIA_STORE[media_id] = {
-        "media_id": media_id,
-        "url": f"memory://{media_id}",
-        "width": width,
-        "height": height,
-        "hash": ph,
-        "palette": palette,
-        "created_at": time.time(),
-        "data": raw,
-        "content_type": file.content_type or "application/octet-stream",
-    }
-    return MediaUploadResponse(**{k: v for k, v in _MEDIA_STORE[media_id].items() if k not in {"data","created_at"}})
+        meta = media_store.upload_image(raw, file.content_type or "application/octet-stream")
+        print(f"[media.upload] stored media_id={meta.get('media_id')} hash={meta.get('hash')} url={meta.get('url')}")
+        return MediaUploadResponse(**{k: meta[k] for k in ["media_id","url","width","height","hash","palette","content_type"]})
+    except Exception as e:
+        print(f"[media.upload] ERROR {e}")
+        raise HTTPException(500, detail=f"upload_error:{e}")
 
 
 def get_media_batch(media_ids: List[str]):
-    out = []
-    for mid in media_ids:
-        meta = _MEDIA_STORE.get(mid)
-        if meta:
-            out.append({k: v for k, v in meta.items() if k not in {"data"}})
-    return out
+    """주어진 media_id 목록에 대한 메타데이터 배열 반환 (Firebase 전용).
+
+    존재하지 않는 id 는 무시. 실패 시 빈 배열. 디버그 로그 포함.
+    """
+    if not USE_FIREBASE_STORAGE:
+        print(f"[media.get_media_batch] ERROR firebase_storage_not_configured req={media_ids}")
+        return []
+    try:
+        from app.services import media_store as _ms
+        metas = _ms.batch_get(media_ids)
+        allow = {"media_id","url","width","height","hash","palette","content_type"}
+        shaped = [{k: m[k] for k in allow if k in m} for m in metas]
+        if len(shaped) != len(media_ids):
+            missing = set(media_ids) - {m['media_id'] for m in shaped}
+            if missing:
+                print(f"[media.get_media_batch] missing={list(missing)} found={len(shaped)}")
+        return shaped
+    except Exception as e:
+        print(f"[media.get_media_batch] ERROR {e} req={media_ids}")
+        return []
 
 
 @router.get("/{media_id}/meta", response_model=MediaMetaResponse)
 def get_media_meta(media_id: str):
-    if USE_FIREBASE_STORAGE:
-        meta = media_store.get_media(media_id)
-        if not meta:
-            raise HTTPException(404, detail="not_found")
-        return MediaMetaResponse(**{k: meta[k] for k in ["media_id","url","width","height","hash","palette","content_type"]})
-    else:
-        meta = _MEDIA_STORE.get(media_id)
-        if not meta:
-            raise HTTPException(404, detail="not_found")
-        return MediaMetaResponse(**{k: v for k, v in meta.items() if k not in {"data"}})
+    if not USE_FIREBASE_STORAGE:
+        raise HTTPException(500, detail="firebase_storage_not_configured")
+    meta = media_store.get_media(media_id)
+    if not meta:
+        print(f"[media.meta] not_found media_id={media_id}")
+        raise HTTPException(404, detail="not_found")
+    print(f"[media.meta] hit media_id={media_id}")
+    return MediaMetaResponse(**{k: meta[k] for k in ["media_id","url","width","height","hash","palette","content_type"]})
 
 
 @router.get("/{media_id}")
 def get_media_raw(media_id: str):
-    if USE_FIREBASE_STORAGE:
-        meta = media_store.get_media(media_id)
-        if not meta:
-            raise HTTPException(404, detail="not_found")
-        # Return redirect link pattern (client fetch directly)
-        return {"redirect_url": meta.get("url")}
-    else:
-        meta = _MEDIA_STORE.get(media_id)
-        if not meta:
-            raise HTTPException(404, detail="not_found")
-        data = meta.get("data")
-        ct = meta.get("content_type", "application/octet-stream")
-        return Response(content=data, media_type=ct)
+    if not USE_FIREBASE_STORAGE:
+        raise HTTPException(500, detail="firebase_storage_not_configured")
+    meta = media_store.get_media(media_id)
+    if not meta:
+        print(f"[media.raw] not_found media_id={media_id}")
+        raise HTTPException(404, detail="not_found")
+    return {"redirect_url": meta.get("url")}

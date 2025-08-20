@@ -13,9 +13,10 @@ from config import settings
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
-# Image similarity configuration
+# Image similarity & attachment configuration
 IMAGE_SIMILARITY_TOP_K = 5  # max number of similar items to show
 IMAGE_SIMILARITY_THRESHOLD = 0.70  # minimum cosine similarity (dot since embeddings normalized)
+MAX_MEDIA_PER_MESSAGE = 3  # allow up to 3 images per user message
 
 class CreateSessionRequest(BaseModel):
     user_id: Optional[str] = None
@@ -69,9 +70,9 @@ def create_session(req: CreateSessionRequest):
 
 @router.post("/send", response_model=SendMessageResponse)
 def send_message(req: SendMessageRequest):
-    # Validate single image constraint
-    if req.media_ids and len(req.media_ids) > 1:
-        raise HTTPException(status_code=400, detail="only_one_media_allowed")
+    # Validate attachment count (max 3 images)
+    if req.media_ids and len(req.media_ids) > MAX_MEDIA_PER_MESSAGE:
+        raise HTTPException(status_code=400, detail="too_many_media")
     # 첨부 메타 (사용자 메시지에 이미지 참조 저장)
     user_meta = None
     if req.media_ids:
@@ -82,6 +83,7 @@ def send_message(req: SendMessageRequest):
             medias = []
         # Validate existence
         if not medias or len(medias) != len(req.media_ids):
+            print(f"[chat.send] invalid_media_id debug - requested={req.media_ids} found={len(medias)} metas={medias}")
             raise HTTPException(status_code=400, detail="invalid_media_id")
         if medias:
             user_meta = {"attachments": medias}
@@ -118,7 +120,7 @@ def send_message(req: SendMessageRequest):
             if pal:
                 hex_color = pal[0]
                 break
-        # run similarity search (top 3) if embedding present
+        # run similarity search (top 3) if embedding present (use first attachment as anchor)
         try:
             mid0 = atts[0].get("media_id") if atts else None
             if mid0:
