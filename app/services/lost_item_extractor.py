@@ -109,6 +109,19 @@ def _analyze_rule(user_text: str) -> Dict[str, str]:
                 if sub in schema.SUBCATEGORIES.get(found["category"], []):
                     found["subcategory"] = sub
                 break
+    # direct subcategory mention (user provided 소분류만) -> infer category
+    if "subcategory" not in found:
+        # Scan all defined subcategories; first match wins
+        for cat, subs in schema.SUBCATEGORIES.items():
+            for sub in subs:
+                if sub and sub in text:  # simple containment is acceptable for current Korean terms
+                    found["subcategory"] = sub
+                    # Only set category if not already inferred via other means
+                    if "category" not in found:
+                        found["category"] = cat
+                    break
+            if "subcategory" in found:
+                break
     # colors (collect all then choose representative)
     tokens = re.split(r"[\s,./]+", text)
     colors: List[str] = []
@@ -163,7 +176,7 @@ def _validate(extracted: Dict[str, str]) -> Dict[str, str]:
     if sub and cat and sub in schema.SUBCATEGORIES.get(cat, []):
         out["subcategory"] = sub
     elif sub and not cat:
-        # try infer category from subcategory membership
+        # infer category from subcategory membership (robust fallback)
         for c, subs in schema.SUBCATEGORIES.items():
             if sub in subs:
                 out["category"] = c

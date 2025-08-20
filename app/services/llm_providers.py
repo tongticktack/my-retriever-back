@@ -117,13 +117,18 @@ class OpenAIProvider(BaseLLMProvider):
         self.model = settings.OPENAI_MODEL_NAME
 
     def generate(self, messages: List[ChatMessage], **kwargs) -> str:
-        # Map to OpenAI format
-        formatted = []
+        # Map to OpenAI format (supports content as str OR multimodal list already prepared upstream)
+        formatted: List[Dict[str, Any]] = []
         for m in messages:
             role = m.get("role")
             if role not in {"user", "assistant", "system"}:
                 continue
-            formatted.append({"role": role, "content": m.get("content", "")})
+            content = m.get("content", "")
+            # extraction_controller 가 vision 사용 시 content 를 list[parts] 로 전달
+            if isinstance(content, list):
+                formatted.append({"role": role, "content": content})
+            else:
+                formatted.append({"role": role, "content": str(content)})
         try:
             resp = openai.chat.completions.create(model=self.model, messages=formatted, timeout=15)  # type: ignore
             self._last_status = "ok"

@@ -32,11 +32,15 @@ class Settings(BaseSettings):
     EMBEDDING_DIM_IMAGE: int = 512  # 해시 기본값 (실제 모델 사용 시 런타임 감지 가능)
     EMBEDDING_DIM_TEXT: int = 768
     EMBEDDING_VERSION: str = "v1"
+
+    # Multi-image distinct object detection threshold (cosine similarity)
+    MULTI_IMAGE_MIN_INTERNAL_SIMILARITY: float = 0.45  # env override 가능
     
     # prompt
     # Prompt bundle version (intent/extraction/guard). Set via env PROMPT_VERSION.
     PROMPT_VERSION: int = 2
-    SYSTEM_PROMPT_FILE: str = "app/prompts/system_prompt_v2.txt"  # default to v2 identity-enhanced prompt
+    # Default system prompt now upgraded to v3 (richer self-intro & structured style guidelines)
+    SYSTEM_PROMPT_FILE: str = "app/prompts/system_prompt_v3.txt"
 
 
 settings = Settings()

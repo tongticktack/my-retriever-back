@@ -8,7 +8,7 @@ Responsibilities:
 - Maintain per-item stages: collecting -> ready -> confirmed.
 """
 from __future__ import annotations
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List, Optional
 import re
 import json
 from datetime import datetime, timedelta
@@ -21,40 +21,51 @@ from config import settings
 
 DATE_ISO_RE = re.compile(r"20\d{2}-\d{2}-\d{2}$")
 
-PERSONA_PREFIXES = [
-    "제가 더 정확히 도와드리려면 ",
-    "정확한 검색을 위해 ",
-]
+PERSONA_PREFIXES: List[str] = []  # deprecated; kept for backward compatibility
 
 # Intent keyword heuristics
 SHORT_GREETING_TOKENS = ["안녕", "안녕하세요", "hi", "hello", "ㅎㅇ"]
+# Identity / capability inquiry patterns considered friendly opening, not off-topic
+INTRO_PATTERNS = [
+    r"너.*누구", r"너.*뭐하는", r"넌 누구", r"누구세요", r"정체성", r"역할이 뭐", r"무슨 역할", r"무엇을 할 수", r"뭐 할 수", r"무슨 일을", r"할 수 있어\??"
+]
 INTENT_LABELS = ["greeting", "policy", "item", "confirm", "cancel", "other"]
 _INTENT_CACHE: Dict[str, str] = {}
 _INTENT_CACHE_MAX = 500
 
 # Toggle for final response guard LLM (lightweight style/safety polish)
 ENABLE_RESPONSE_GUARD = True
+# Optional stylistic enrichment (makes baseline functional message warmer & empathetic)
+ENABLE_STYLE_ENRICH = True
+# Allow light cute persona tone (dog helper) in enrichment
+ALLOW_CUTE_PERSONA = True
+# 1=은은, 2=표준 귀여움, 3=강조 (과잉 방지 로직 유지)
+CUTE_TONE_LEVEL = 2
 # PROMPT_VERSION now driven by environment via config.Settings (PROMPT_VERSION env var)
 PROMPT_VERSION = getattr(settings, 'PROMPT_VERSION', 1)
 
+# Vision confidence threshold for optional fields (brand/material/pattern ...)
+VISION_OPTIONAL_CONF_THRESHOLD = 0.55
+VISION_AUTO_OVERRIDE_THRESHOLD = 0.85  # high-confidence vision override threshold for critical fields
+
 def _persona_wrap(prompt: str, kind: str) -> str:
-    """Apply lightweight persona phrasing depending on reply type."""
-    if kind == 'confirm':
-        return prompt
-    if kind == 'disambiguate':
-        return "날짜가 조금 모호해요. " + prompt
-    # ask (default)
-    pref = PERSONA_PREFIXES[hash(prompt) % len(PERSONA_PREFIXES)]
-    return pref + prompt
+    # Neutral passthrough; style handled by higher-level system prompt / guard.
+    return prompt
 
 
 def _classify_intent_rule(text: str) -> str:
     t = text.strip().lower()
     if not t:
         return "other"
-    # short pure greeting only
+    # short pure greeting only OR identity/intro queries
     if any(t == g.lower() or (t.startswith(g.lower()) and len(t) <= len(g)+2) for g in SHORT_GREETING_TOKENS):
         return "greeting"
+    for pat in INTRO_PATTERNS:
+        try:
+            if re.search(pat, t):
+                return "greeting"
+        except Exception:
+            continue
     return "other"
 
 
@@ -112,10 +123,7 @@ def classify_intent(text: str) -> Tuple[str, str]:
         return _INTENT_CACHE[key], "cache"
     # confirm/cancel tokens quick
     low = key
-    if low in {t.lower() for t in CONFIRM_TOKENS}:
-        _INTENT_CACHE[key] = "confirm"; return "confirm", "rule"
-    if low in {t.lower() for t in CANCEL_TOKENS}:
-        _INTENT_CACHE[key] = "cancel"; return "cancel", "rule"
+    # Removed hard token shortcut for confirm/cancel to let LLM handle nuanced affirmation/negation.
     rule = _classify_intent_rule(text)
     if rule in {"greeting"}:
         _INTENT_CACHE[key] = rule; return rule, "rule"
@@ -143,8 +151,15 @@ def _load_extraction_prompt() -> str:
     except Exception:
         return ""
 
+def _load_multimodal_prompt() -> str:
+    path = Path("app/prompts/multimodal_extraction_v3.txt")
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
 
-def _strict_llm_extract(user_text: str, current: Dict[str, str]) -> Dict[str, str]:  # pragma: no cover (LLM)
+
+def _strict_llm_extract(user_text: str, current: Dict[str, str], image_urls: Optional[List[str]] = None) -> Dict[str, Any]:  # pragma: no cover (LLM)
     """LLM JSON-only structured extraction using external prompt file with retry & light repair."""
     llm = get_llm()
     today = datetime.now().date().isoformat()
@@ -155,27 +170,46 @@ def _strict_llm_extract(user_text: str, current: Dict[str, str]) -> Dict[str, st
     except Exception:
         yesterday = today
         d3 = today
-    prompt_tmpl = _load_extraction_prompt()
+    # Choose prompt: multimodal if images present else text-only
+    if image_urls:
+        prompt_tmpl = _load_multimodal_prompt() or _load_extraction_prompt()
+    else:
+        prompt_tmpl = _load_extraction_prompt()
     current_json = json.dumps(current, ensure_ascii=False) if current else "{}"
     if prompt_tmpl:
         placeholders = {
             'TODAY': today,
             'YESTERDAY': yesterday,
             'D3': d3,
+            'D2': (datetime.now().date() - timedelta(days=2)).isoformat(),
+            'D7': (datetime.now().date() - timedelta(days=7)).isoformat(),
             'CATEGORIES': ", ".join(schema.PRIMARY_CATEGORIES),
             'CURRENT_JSON': current_json,
             'USER_TEXT': user_text.strip(),
+            'IMAGE_COUNT': str(len(image_urls) if image_urls else 0),
         }
         system = prompt_tmpl
-        # simple safe replacement (avoids str.format JSON brace conflict)
         for k, v in placeholders.items():
             system = system.replace('{'+k+'}', v)
     else:
         system = "단일 JSON {category, subcategory, color, lost_date, region}; 없는 값 키 생략; today=" + today
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_text.strip()}
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": system}
     ]
+    # Vision 지원 (OpenAI 4o-mini 등) - provider 가 openai 이고 이미지 URL 이 있으면 멀티모달 parts 구성
+    llm_name = getattr(llm, 'name', '')
+    if image_urls and llm_name == 'openai':
+        parts: List[Dict[str, Any]] = []
+        if user_text.strip():
+            parts.append({"type": "text", "text": user_text.strip()})
+        for url in image_urls[:3]:  # safety cap
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+        # 이미지만 있는 경우를 위해 최소 한개의 text guidance 추가 (추출 지시)
+        if not user_text.strip():
+            parts.insert(0, {"type": "text", "text": "이미지에 보이는 분실물 정보를 category, subcategory, color, lost_date(모르면 빈칸), region(모르면 빈칸) JSON 추출"})
+        messages.append({"role": "user", "content": parts})
+    else:
+        messages.append({"role": "user", "content": user_text.strip()})
 
     def _attempt_parse(raw: str) -> Dict[str, str] | None:
         snippet = raw.strip()
@@ -205,12 +239,68 @@ def _strict_llm_extract(user_text: str, current: Dict[str, str]) -> Dict[str, st
                 pass
         return None
 
-    def _clean(parsed: Dict[str, Any]) -> Dict[str, str]:
-        cleaned: Dict[str, str] = {}
-        for k in ["category", "subcategory", "color", "lost_date", "region"]:
+    def _clean(parsed: Dict[str, Any]) -> Dict[str, Any]:
+        cleaned: Dict[str, Any] = {}
+        scalar_keys = ["category", "subcategory", "color", "lost_date", "region", "brand", "material", "pattern"]
+        for k in scalar_keys:
             v = parsed.get(k)
-            if isinstance(v, str) and v.strip():
-                cleaned[k] = v.strip()
+            if isinstance(v, str):
+                t = v.strip()
+                if t:
+                    cleaned[k] = t[:50]
+        # Arrays
+        def _norm_list(vals, limit):
+            out = []
+            if isinstance(vals, list):
+                for x in vals:
+                    if not isinstance(x, str):
+                        continue
+                    s = x.strip()
+                    if not s:
+                        continue
+                    if len(s) > 25:
+                        s = s[:25]
+                    if s not in out:
+                        out.append(s)
+                    if len(out) >= limit:
+                        break
+            return out
+        nf = _norm_list(parsed.get('notable_features'), 5)
+        if nf:
+            cleaned['notable_features'] = nf
+        ts = _norm_list(parsed.get('text_snippets'), 4)
+        # rudimentary PII filter: remove email-like / long digit sequences
+        filtered_ts = []
+        for s in ts:
+            if '@' in s:
+                continue
+            if sum(c.isdigit() for c in s) >= 6:
+                continue
+            filtered_ts.append(s)
+        if filtered_ts:
+            cleaned['text_snippets'] = filtered_ts
+        # confidences
+        confidences = parsed.get('confidences')
+        kept_conf: Dict[str, float] = {}
+        if isinstance(confidences, dict):
+            for k, v in confidences.items():
+                try:
+                    f = float(v)
+                except Exception:
+                    continue
+                if f < 0 or f > 1:
+                    continue
+                kept_conf[k] = round(f, 2)
+        # Apply threshold removal for optional fields
+        for opt_key in ["brand", "material", "pattern"]:
+            if opt_key in cleaned:
+                conf_v = kept_conf.get(opt_key)
+                if conf_v is not None and conf_v < VISION_OPTIONAL_CONF_THRESHOLD:
+                    # drop field & its confidence entry
+                    cleaned.pop(opt_key, None)
+                    kept_conf.pop(opt_key, None)
+        if kept_conf:
+            cleaned['confidences'] = kept_conf
         return cleaned
 
     raw = ""
@@ -237,8 +327,8 @@ def _merge_extracted(base: Dict[str, str], new: Dict[str, str]) -> Dict[str, str
 # _has_ambiguity: removed (was unused after logic refactor)
 
 
-CONFIRM_TOKENS = {"예", "네", "진행", "검색", "yes", "y"}
-CANCEL_TOKENS = {"아니오", "아니", "취소", "no", "n"}
+CONFIRM_TOKENS: set[str] = set()  # deprecated
+CANCEL_TOKENS: set[str] = set()
 OFF_TOPIC_KEYWORDS = [
     "날씨", "주식", "투자", "코인", "암호화폐", "건강", "병원", "진료", "식단", "아침에 뭐", "요리", "레시피",
     "운동", "다이어트", "공부", "시험", "여행", "호텔"
@@ -253,14 +343,12 @@ def should_run_extraction(item: Dict[str, Any], user_text: str) -> bool:
     stage = item.get("stage")
     if stage not in {"collecting", "ready"}:
         return False
-    token = user_text.strip().lower()
-    if token in {t.lower() for t in CONFIRM_TOKENS | CANCEL_TOKENS}:
-        return False
+    # Always run extraction; confirmation now inferred at higher layer (LLM intent), not by raw tokens.
     _log_metric('extraction.trigger', reason='always')
     return True
 
 
-def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool) -> Tuple[str | None, Dict[str, Any], str, Dict[str, Any] | None]:
+def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool, image_urls: Optional[List[str]] = None) -> Tuple[str | None, Dict[str, Any], str, Dict[str, Any] | None]:
     """Process user message relative to lost item flow.
     Returns (assistant_reply_or_none, updated_lost_state, model_label, active_item_snapshot).
     If assistant_reply_or_none is None the caller may proceed with general LLM chat.
@@ -282,17 +370,20 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool)
     intent, intent_source = classify_intent(user_text)
     _log_metric('intent.classified', intent=intent, source=intent_source)
     # Soft-lock handling: if previously locked and user still off-topic, short circuit
-    if lost_state.get("soft_lock") and intent not in {"item"}:
+    if lost_state.get("soft_lock") and intent not in {"item", "greeting"}:
         reply = _persona_wrap(
             "서비스가 분실물 회수 지원 모드로 잠시 잠겼어요. 분실한 물건의 종류, 장소, 날짜 중 하나라도 알려주시면 다시 도와드릴 수 있어요.",
             'ask'
         )
         return reply, lost_state, "intent:locked", _snapshot(idx, current)
+    # Allow greeting to release soft lock naturally
+    if lost_state.get("soft_lock") and intent == 'greeting':
+        lost_state.pop("soft_lock", None)
 
     if intent in {"greeting", "policy", "other"}:
         if intent == "greeting":
-            reply = _persona_wrap("만나서 반가워요! 분실물을 찾고 싶으시면 어떤 물건을 어디서 언제쯤 잃어버렸는지 말해 주세요.", 'ask')
-            return reply, lost_state, "intent:greeting", _snapshot(idx, current)
+            # Pass through: allow general LLM (system prompt) to craft intro instead of fixed template
+            return None, lost_state, "intent:greeting-pass", _snapshot(idx, current)
         if intent == "policy":
             reply = (
                 "분실물은 발견 후 경찰/유실물 센터에 인계되면 통상 일정 기간(예: 6개월 전후, 품목/법규에 따라 차이) 보관 후 처리됩니다. "
@@ -336,19 +427,18 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool)
         return _persona_wrap("진행을 취소할 단계가 아직 아니에요. 물건 정보를 조금 더 알려주실래요?", 'ask'), lost_state, 'intent:cancel-misplaced', _snapshot(idx, current)
 
     # Confirmation handling (only when intent=item)
-    if current.get("stage") == "ready":
-        if user_lower in {"예", "네", "진행", "검색", "yes", "y"}:
-            current["stage"] = "confirmed"
-            snapshot = _snapshot(idx, current)
-            return (
-                "검색을 준비 중입니다. (경찰청 API 연동 예정) 다른 물건도 신고하시겠습니까? '새 물건' 입력으로 새로 시작해요.",
-                lost_state,
-                "lost-item-flow.v2",
-                snapshot,
-            )
-        if user_lower in {"아니오", "아니", "취소", "no", "n"}:
-            current["stage"] = "collecting"
-            # fall through to ask again
+    if current.get("stage") == "ready" and intent == 'confirm':
+        current["stage"] = "confirmed"
+        snapshot = _snapshot(idx, current)
+        return (
+            "검색 절차를 시작합니다. (경찰청 API 연동 예정) 다른 분실물도 계속 등록할 수 있어요. 새로 시작하려면 '새 물건'이라고 입력하세요.",
+            lost_state,
+            "lost-item-flow.v2",
+            snapshot,
+        )
+    if current.get("stage") == "ready" and intent == 'cancel':
+        current["stage"] = "collecting"
+        # fall through to ask again
 
     # If confirmed and user gives more info without start_new trigger -> start a new item
     if current.get("stage") == "confirmed" and not start_new:
@@ -370,11 +460,56 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool)
         # Rule first
         rule_part = _rule_extract(user_text)
         _merge_extracted(extracted, rule_part)
-        # Always call strict LLM for potential refinement
+        # Always call strict LLM for potential refinement (now vision-aware)
         missing_before = li_ext.compute_missing(extracted)
         _log_metric('extraction.llm_call', missing=len(missing_before), ambiguity='1' if 'lost_date_candidates' in extracted else '0')
-        llm_part = _strict_llm_extract(user_text, extracted)
+        llm_part = _strict_llm_extract(user_text, extracted, image_urls=image_urls)
+        prev_keys = set(extracted.keys())
+        pre_values = {k: extracted.get(k) for k in ["category", "subcategory", "color"] if extracted.get(k)}
         _merge_extracted(extracted, llm_part)
+        # Source tagging + conflict detection
+        conflicts = current.get('conflicts') or {}
+        vision_conf_map = {}
+        if llm_part and isinstance(llm_part, dict):
+            conf_dict = llm_part.get('confidences') if isinstance(llm_part.get('confidences'), dict) else {}
+            # normalize confidence numbers
+            for ck, cv in conf_dict.items():
+                try:
+                    vision_conf_map[ck] = float(cv)
+                except Exception:
+                    pass
+            sources = current.setdefault('sources', {})
+            for k in llm_part.keys():
+                if k == 'confidences':
+                    continue
+                if k not in prev_keys and k not in sources and k in extracted:
+                    sources[k] = 'vision' if image_urls else 'llm'
+            # Detect conflicts for core fields (text value retained unless override criteria)
+            for field in ["category", "subcategory", "color"]:
+                if field in llm_part and field in pre_values and llm_part[field] != pre_values[field]:
+                    # store conflict structure
+                    if field not in conflicts:
+                        conflicts[field] = {
+                            'text_value': pre_values[field],
+                            'vision_value': llm_part[field],
+                            'vision_confidence': vision_conf_map.get(field)
+                        }
+            # Auto override rule (color only or also category/subcategory based on high confidence?)
+            for field in ["color", "category", "subcategory"]:
+                if field in conflicts:
+                    vc = conflicts[field].get('vision_confidence') or 0.0
+                    if vc >= VISION_AUTO_OVERRIDE_THRESHOLD:
+                        # perform override; keep original as alt_<field>_text
+                        original = conflicts[field]['text_value']
+                        extracted[field] = conflicts[field]['vision_value']
+                        extracted[f'alt_{field}_text'] = original
+                        sources[field] = 'vision-override'
+                        conflicts[field]['auto_overridden'] = True
+                    else:
+                        conflicts[field]['auto_overridden'] = False
+            if conflicts:
+                current['conflicts'] = conflicts
+            current['sources'] = sources
         # Validate (will keep candidates if present and no final date)
         extracted = li_ext._validate(extracted)  # type: ignore[attr-defined]
         current["extracted"] = extracted
@@ -438,11 +573,19 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool)
             if current.get("stage") != "confirmed":
                 current["stage"] = "ready"
                 reply = _persona_wrap(_build_confirmation_summary(extracted), 'confirm')
+                # 사진 첨부 안내 (아직 이미지 없고 한 번도 묻지 않은 경우)
+                if not current.get("media_ids") and not current.get("asked_photo"):
+                    reply += "\n\n추가로 사진이 있다면 지금 최대 3장까지 올려주세요. 없으면 그냥 계속 말씀하거나 검색 진행 의사를 자연스럽게 표현해 주세요."
+                    current["asked_photo"] = True
             else:
                 reply = None  # no need to say anything; allow general chat
 
     snapshot = _snapshot(idx, current)
     # Optional final response guard polishing (only for replies we generated here)
+    if reply and ENABLE_STYLE_ENRICH:
+        enriched = _style_enrich(reply, intent="item", item_snapshot=snapshot)
+        if enriched:
+            reply = enriched
     if reply and ENABLE_RESPONSE_GUARD:
         guarded = _guard_response(reply, intent="item", model_label="lost-item-flow.v2", item_snapshot=snapshot)
         if guarded:
@@ -466,30 +609,19 @@ def _log_metric(event: str, **fields: Any) -> None:
 
 
 def _build_confirmation_summary(extracted: Dict[str, Any]) -> str:
-    friendly = []
-    cat = extracted.get('category')
-    sub = extracted.get('subcategory')
-    if cat and sub:
-        friendly.append(f"- **물건 종류**: {cat} ({sub})")
-    elif cat:
-        friendly.append(f"- **물건 종류**: {cat}")
-    col = extracted.get('color')
-    if col:
-        friendly.append(f"- **색상**: {col}")
-    ld = extracted.get('lost_date')
-    if ld:
-        friendly.append(f"- **잃어버린 날짜**: {ld}")
-    reg = extracted.get('region')
-    if reg:
-        friendly.append(f"- **장소**: {reg}")
-    if not friendly:
-        return "수집된 정보를 정리하는 중이에요. 조금만 기다려주세요!"
-    bullet = "\n".join(friendly)
-    return (
-        "**확인 한번만 부탁드려요!** 제가 꼬리를 살랑살랑 흔들면서 모은 정보는 아래와 같아요:\n\n" +
-        bullet +
-        "\n\n괜찮다면 **'예'** 라고 답해주시면 이제 루시가 주인님의 물건을 찾아볼 준비를 할게요! (예/아니오)"
-    )
+    parts = []
+    cat = extracted.get('category'); sub = extracted.get('subcategory')
+    if cat and sub: parts.append(f"종류: {cat} ({sub})")
+    elif cat: parts.append(f"종류: {cat}")
+    col = extracted.get('color');
+    if col: parts.append(f"색상: {col}")
+    ld = extracted.get('lost_date');
+    if ld: parts.append(f"날짜: {ld}")
+    reg = extracted.get('region');
+    if reg: parts.append(f"장소: {reg}")
+    if not parts:
+        return "정보 정리 중입니다."
+    return "확인해주세요:\n" + "\n".join(f"- {p}" for p in parts) + "\n수정할 내용이 있으면 바로 적어주시고, 괜찮으면 계속 진행 의사를 자연스럽게 표현해주세요."
 
 
 def _guess_field(extracted: Dict[str, str], field: str) -> str | None:  # pragma: no cover (LLM)
@@ -564,5 +696,79 @@ def _guard_response(draft: str, intent: str, model_label: str, item_snapshot: Di
                 return draft
             return out
         return draft
+    except Exception:
+        return draft
+
+
+def _style_enrich(draft: str, intent: str, item_snapshot: Dict[str, Any]) -> str:
+    """Lightweight style enrichment: expand tone with empathy & clarity while preserving facts.
+    Keeps bullet structure, field labels, JSON fragments. Avoids adding yes/no rigid prompts.
+    """
+    try:
+        llm = get_llm()
+        item_json = json.dumps(item_snapshot.get("extracted") or {}, ensure_ascii=False)
+        if ALLOW_CUTE_PERSONA:
+            # Few-shot 스타일 예시는 간결하게 포함 (과한 토큰 낭비 방지)
+            examples = (
+                "원문: '정보 정리 중입니다.'\n"
+                "개선: '살짝 코를 킁킁하면서 정리 중이에요… 잠깐만 기다려주세요 🐾'\n\n"
+                "원문: '- 색상: 검정'\n"
+                "개선: '- 색상: 검정 (진한 느낌이네요!)'\n"
+            ) if CUTE_TONE_LEVEL >= 2 else ""
+            intensity = {
+                1: "은은하고 절제된",
+                2: "눈에 띄지만 과하지 않은",
+                3: "조금 더 적극적이지만 여전히 자연스러운"
+            }.get(CUTE_TONE_LEVEL, "눈에 띄지만 과하지 않은")
+            max_emoji = {1:1,2:3,3:4}.get(CUTE_TONE_LEVEL,3)
+            tail_expr = {1:1,2:2,3:3}.get(CUTE_TONE_LEVEL,2)
+            system = (
+                f"너는 분실물 도우미 '강아지' 캐릭터다. DRAFT를 더 따뜻하고 {intensity} 강아지스러운 말투로 재작성하되 사실/필드/숫자/날짜/색상은 절대 변형하지 마. "
+                "규칙:\n"
+                f"1) 말투: 부드러운 존댓말+살짝 귀여운 어미(~요, ~했어요, ~할게요). 과한 애교 금지.\n"
+                f"2) 강아지 표현(예: 꼬리 살랑, 코 킁킁, 열심히 찾아볼게요) 최대 {tail_expr}회.\n"
+                f"3) 이모지 0~{max_emoji}개 (허용: 🐶 🐾 🔍 ✨). 연속 사용 금지.\n"
+                "4) 필요하면 한 줄 공감 (걱정되셨죠 / 잘 찾아볼게요 등).\n"
+                "5) 불릿/구조/핵심 키워드 유지, 불릿 안 값 절대 변경하지 말기.\n"
+                "6) 새로운 '예/아니오' 강요 문구 만들지 말기.\n"
+                "7) 추측/허위/과장 추가 금지. 모르는 건 건너뜀.\n"
+                "8) 2~6문장, 380자 이내.\n"
+                "9) 사진 요청 이미 있으면 반복하지 말기.\n"
+                "10) 동일 이모지 반복 사용 자제.\n"
+                "출력: 재작성 텍스트만.\n\n"
+                f"간단 예시:\n{examples}" 
+            )
+        else:
+            system = (
+                "너는 답변 스타일 향상 모듈. 입력 초안(DRAFT)을 한국어로 더 자연스럽고 공감 있게 다듬되, 의미/사실/필드명/날짜/색상/카테고리 등 핵심 정보는 절대 삭제/왜곡하지 마. "
+                "규칙:\n"
+                "1) 목록/불릿/코드/JSON 구조 유지.\n"
+                "2) 과한 이모지 피하고 0~3개 이모지 허용.\n"
+                "3) 사용자가 편안히 느끼도록 짧은 공감 1문장 가능.\n"
+                "4) '예/아니오' 같은 이분법 강요 표현 추가하지 말 것.\n"
+                "5) 2~5문장 또는 250자 이내.\n"
+                "6) DRAFT 내 불릿은 그대로 두고 필요하면 불릿 위/아래에 간결 문장만 추가.\n"
+                "7) 추측 추가 금지.\n"
+                "8) 사진 요청 문구가 이미 있다면 중복 요청 피함.\n"
+                "출력은 다듬어진 텍스트만."
+            )
+        user = f"ITEM_JSON: {item_json}\nINTENT: {intent}\nDRAFT:\n{draft}\n\n개선된 응답:"  # context bundling
+        out = llm.generate([
+            {"role": "system", "content": system},
+            {"role": "user", "content": user}
+        ]).strip()
+        if not out:
+            return draft
+        # Basic safety: ensure core field tokens not lost (if they existed)
+        core_tokens = []
+        for k, v in (item_snapshot.get("extracted") or {}).items():
+            if isinstance(v, str) and v and v in draft:
+                core_tokens.append(v)
+        missing_core = [t for t in core_tokens if t not in out]
+        if missing_core:
+            return draft  # revert to be safe
+        if len(out) > 800:
+            return draft
+        return out
     except Exception:
         return draft

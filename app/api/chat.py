@@ -17,6 +17,8 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 IMAGE_SIMILARITY_TOP_K = 5  # max number of similar items to show
 IMAGE_SIMILARITY_THRESHOLD = 0.70  # minimum cosine similarity (dot since embeddings normalized)
 MAX_MEDIA_PER_MESSAGE = 3  # allow up to 3 images per user message
+# Multi-image 내 최소 쌍 유사도 임계 (환경 변수로 조정 가능)
+MULTI_IMAGE_MIN_INTERNAL_SIMILARITY = getattr(settings, 'MULTI_IMAGE_MIN_INTERNAL_SIMILARITY', 0.45)
 
 class CreateSessionRequest(BaseModel):
     user_id: Optional[str] = None
@@ -111,107 +113,176 @@ def send_message(req: SendMessageRequest):
         lost_state["_img_cache"] = {}
     image_search_results = None
     # Soft-fill color from image palette if any attachments and active collecting item missing color
+    majority_image_color = None
+    multi_image_conflict = False
     if user_meta and user_meta.get("attachments"):
         atts = user_meta.get("attachments")
-        # pick first palette color hex -> map to nearest known color (simple heuristic)
-        hex_color = None
-        for a in atts:
-            pal = a.get("palette")
+        # Distinct-object heuristic: pairwise embedding similarity check
+        if len(atts) > 1:
+            embs = []
+            try:
+                for a in atts[:MAX_MEDIA_PER_MESSAGE]:
+                    mid = a.get("media_id")
+                    if not mid:
+                        continue
+                    emb = media_store.get_embedding(mid)
+                    if emb is not None:
+                        embs.append((mid, emb))
+                # pairwise min similarity
+                def _dot(u,v):
+                    return sum(x*y for x,y in zip(u,v)) / ( (sum(x*x for x in u)**0.5) * (sum(y*y for y in v)**0.5) + 1e-9 )
+                min_sim = 1.0
+                for i in range(len(embs)):
+                    for j in range(i+1, len(embs)):
+                        s = _dot(embs[i][1], embs[j][1])
+                        if s < min_sim:
+                            min_sim = s
+                if len(embs) >= 2 and min_sim < MULTI_IMAGE_MIN_INTERNAL_SIMILARITY:
+                    multi_image_conflict = True
+            except Exception as e:
+                print(f"[chat.multi_image_conflict_check] error: {e}")
+        # 수집된 팔레트들을 기반으로 대표 hex 후보 집계
+        hex_candidates = []
+        for a in atts[:MAX_MEDIA_PER_MESSAGE]:
+            pal = a.get("palette") or []
             if pal:
-                hex_color = pal[0]
-                break
-        # run similarity search (top 3) if embedding present (use first attachment as anchor)
+                hex_candidates.append(pal[0])
+        # hex -> schema.COLORS 매핑 함수
+        def _hex_to_color(hx: str) -> str | None:
+            import re
+            m = re.match(r"#([0-9a-fA-F]{6})", hx or "")
+            if not m:
+                return None
+            rgbhex = m.group(1)
+            r = int(rgbhex[0:2],16); g = int(rgbhex[2:4],16); b = int(rgbhex[4:6],16)
+            if max(r,g,b) < 40:
+                return "검정"
+            if min(r,g,b) > 220:
+                return "흰색"
+            # dominant channel
+            if r > g and r > b:
+                return "빨강"
+            if g > r and g > b:
+                return "초록"
+            if b > r and b > g:
+                return "파랑"
+            # grayscale-ish
+            if abs(r-g) < 25 and abs(r-b) < 25:
+                return "회색"
+            return "갈색"
+        color_votes = {}
+        for hx in hex_candidates:
+            c = _hex_to_color(hx)
+            if c and c in schema.COLORS:
+                color_votes[c] = color_votes.get(c,0)+1
+        if color_votes:
+            # majority pick (stable tie by sorted name)
+            majority_image_color = sorted(color_votes.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+        hex_color = hex_candidates[0] if hex_candidates else None
+        # run similarity search for each attachment (최대 3), best top-score set 채택
         try:
-            mid0 = atts[0].get("media_id") if atts else None
-            if mid0:
-                emb = media_store.get_embedding(mid0)
-                if emb is not None:
-                    from app.services import faiss_index as _fi
-                    cache = lost_state.get("_img_cache") or {}
-                    # Use cache if available
-                    cached = cache.get(mid0)
-                    if cached:
-                        image_search_results = cached
-                    else:
-                        # Determine indexing key: prefer lost-item key if active item exists
-                        active_index = lost_state.get("active_index")
-                        if active_index is not None:
-                            item_key = f"lost_{req.session_id}_{active_index}"
-                            meta_kind = {"type": "lost_item", "session_id": req.session_id, "active_index": active_index, "media_id": mid0}
-                        else:
-                            item_key = f"media_{mid0}"
-                            meta_kind = {"type": "media", "media_id": mid0, "session_id": req.session_id}
-                        # Add (or refresh skip) index entry
-                        if item_key not in _fi.META:
-                            _fi.add_item(item_key, emb, None, meta_kind)
-                            try:
-                                _fi.save_all()
-                            except Exception as se:
-                                print(f"[faiss.save_all] warn: {se}")
-                        # Search (fetch one extra for potential self filtering)
-                        raw = _fi.search_image(emb, k=IMAGE_SIMILARITY_TOP_K + 1)
-                        # Filter out self + apply threshold
-                        filtered = []
-                        for iid, score, meta in raw:
-                            if iid == item_key:
-                                continue
-                            if score < IMAGE_SIMILARITY_THRESHOLD:
-                                continue
-                            filtered.append((iid, score, meta))
-                            if len(filtered) >= IMAGE_SIMILARITY_TOP_K:
-                                break
-                        image_search_results = filtered if filtered else None
-                        cache[mid0] = image_search_results
-                        lost_state["_img_cache"] = cache
+            from app.services import faiss_index as _fi
+            cache = lost_state.get("_img_cache") or {}
+            best = None
+            best_score = -1.0
+            active_index = lost_state.get("active_index")
+            for idx, att in enumerate(atts[:MAX_MEDIA_PER_MESSAGE]):
+                mid = att.get("media_id")
+                if not mid:
+                    continue
+                emb = media_store.get_embedding(mid)
+                if emb is None:
+                    continue
+                if active_index is not None:
+                    item_key = f"lost_{req.session_id}_{active_index}_{idx}"
+                    meta_kind = {"type":"lost_item","session_id":req.session_id,"active_index":active_index,"media_id":mid,"img_slot":idx}
+                else:
+                    item_key = f"media_{mid}_{idx}"
+                    meta_kind = {"type":"media","session_id":req.session_id,"media_id":mid,"img_slot":idx}
+                if item_key not in _fi.META:
+                    _fi.add_item(item_key, emb, None, meta_kind)
+                    try:
+                        _fi.save_all()
+                    except Exception as se:
+                        print(f"[faiss.save_all] warn: {se}")
+                cached = cache.get(mid)
+                if cached is not None:
+                    cand = cached
+                else:
+                    raw = _fi.search_image(emb, k=IMAGE_SIMILARITY_TOP_K + 1)
+                    filtered = []
+                    for iid, score, meta in raw:
+                        if iid == item_key:
+                            continue
+                        if score < IMAGE_SIMILARITY_THRESHOLD:
+                            continue
+                        filtered.append((iid, score, meta))
+                        if len(filtered) >= IMAGE_SIMILARITY_TOP_K:
+                            break
+                    cand = filtered if filtered else None
+                    cache[mid] = cand
+                if cand and cand[0][1] > best_score:
+                    best_score = cand[0][1]
+                    best = cand
+            image_search_results = best
+            lost_state["_img_cache"] = cache
         except Exception as e:
             print(f"[chat.image_search] error: {e}")
-        if hex_color and lost_state.get("active_index") is not None:
-            try:
-                active = lost_state["items"][lost_state["active_index"]]
-            except Exception:
-                active = None
-            if active:
-                # merge media ids
-                mid_list = [m.get("media_id") for m in atts if m.get("media_id")]
-                if mid_list:
-                    existing = set(active.get("media_ids") or [])
-                    active["media_ids"] = list(existing.union(mid_list))
-                extracted = active.get("extracted", {})
-                if "color" not in extracted:
-                    # crude mapping: simple luminance & hue ranges -> target tokens
-                    import re
-                    m = re.match(r"#([0-9a-fA-F]{6})", hex_color)
-                    if m:
-                        rgbhex = m.group(1)
-                        r = int(rgbhex[0:2],16); g = int(rgbhex[2:4],16); b = int(rgbhex[4:6],16)
-                        # choose by max channel / brightness
-                        if max(r,g,b) < 40:
-                            cand = "검정"
-                        elif min(r,g,b) > 220:
-                            cand = "흰색"
-                        else:
-                            if r > g and r > b:
-                                cand = "빨강"
-                            elif g > r and g > b:
-                                cand = "초록"
-                            elif b > r and b > g:
-                                cand = "파랑"
-                            else:
-                                # fallback grayscale-ish
-                                cand = "회색" if abs(r-g) < 25 and abs(r-b) < 25 else "갈색"
-                        if cand in schema.COLORS:
-                            extracted["color"] = cand
-                            sources = active.get("sources") or {}
-                            sources["color"] = "image-soft-fill"
-                            active["sources"] = sources
-                            active["extracted"] = extracted
-                            # missing recompute deferred to controller after merge
+    if majority_image_color and lost_state.get("active_index") is not None:
+        try:
+            active = lost_state["items"][lost_state["active_index"]]
+        except Exception:
+            active = None
+        if active:
+            # merge media ids
+            mid_list = [m.get("media_id") for m in atts if m.get("media_id")]
+            if mid_list:
+                existing = set(active.get("media_ids") or [])
+                active["media_ids"] = list(existing.union(mid_list))
+            extracted = active.get("extracted", {})
+            if "color" not in extracted:
+                extracted["color"] = majority_image_color
+                sources = active.get("sources") or {}
+                sources["color"] = "image-soft-fill-majority"
+                active["sources"] = sources
+                active["extracted"] = extracted
     user_lower = req.content.strip().lower()
     start_new_trigger = any(kw in user_lower for kw in ["또 잃어버렸", "다른 물건", "새 물건", "추가 물건"]) or user_lower.startswith("새 물건")
 
-    assistant_reply, lost_state, chosen_model, active_item_snapshot = extc.process_message(
-        req.content, lost_state, start_new_trigger
-    )
+    # Vision LLM: 이미지 URL 목록 (공개 URL 기준) 추출하여 controller 전달
+    image_urls = None
+    if user_meta and user_meta.get("attachments"):
+        image_urls = [a.get("url") for a in user_meta.get("attachments") if a.get("url")]
+    if multi_image_conflict:
+        assistant_reply = (
+            "여러 이미지가 서로 다른 물건으로 보입니다. 한 번에 하나의 분실물 이미지(최대 3장: 같은 물건 다른 각도)만 첨부해주세요. "
+            "각 물건은 별도 메시지 또는 '새 물건' 입력 후 이미지를 올려주세요."
+        )
+        chosen_model = "multi-image-validation"
+        active_item_snapshot = None
+    else:
+        assistant_reply, lost_state, chosen_model, active_item_snapshot = extc.process_message(
+            req.content, lost_state, start_new_trigger, image_urls=image_urls
+        )
+    # After extraction reconcile image-derived color vs extracted color if mismatch
+    try:
+        if majority_image_color and lost_state.get("active_index") is not None:
+            active = lost_state["items"][lost_state["active_index"]]
+            extracted = active.get("extracted") or {}
+            cur_color = extracted.get("color")
+            if cur_color and majority_image_color and cur_color != majority_image_color:
+                # Prefer image majority; keep old as alt_color
+                extracted.setdefault("alt_color_llm", cur_color)
+                extracted["color"] = majority_image_color
+                sources = active.get("sources") or {}
+                sources["color"] = "image-majority-override"
+                active["sources"] = sources
+                active["extracted"] = extracted
+                # notify user in reply (prepend note)
+                note = f"(이미지 다수결 색상이 LLM 추출 색상 '{cur_color}' 와 달라 '{majority_image_color}' 로 적용했습니다. 확인 부탁드립니다.)\n"
+                assistant_reply = note + (assistant_reply or "")
+    except Exception as e:
+        print(f"[chat.color_reconcile] error: {e}")
     # If controller produced reply and we have similarity results, augment
     if assistant_reply and image_search_results:
         if image_search_results:
@@ -221,9 +292,32 @@ def send_message(req: SendMessageRequest):
                 label = meta.get('media_id') if isinstance(meta, dict) else None
                 if not label:
                     label = iid
-                lines.append(f"{rank}. {label} (score {score:.3f})")
+                extra_parts = []
+                if isinstance(meta, dict):
+                    if meta.get('category'):
+                        extra_parts.append(meta['category'])
+                    if meta.get('color'):
+                        extra_parts.append(meta['color'])
+                suffix = ("; "+", ".join(extra_parts)) if extra_parts else ""
+                lines.append(f"{rank}. {label} (score {score:.3f}{suffix})")
                 rank += 1
             assistant_reply += f"\n\n(이미지 유사도 후보 ≥ {IMAGE_SIMILARITY_THRESHOLD:.2f})\n" + "\n".join(lines)
+    # Acknowledge image receipt
+    if user_meta and user_meta.get("attachments"):
+        attachments_list = user_meta.get("attachments")
+        count_imgs = len(attachments_list)
+        ack_line = f"이미지 {count_imgs}장 확인했습니다."
+        # enumerate each image id 1,2,3 ...
+        lines_enum = []
+        for i, a in enumerate(attachments_list, start=1):
+            mid = a.get("media_id") or "-"
+            lines_enum.append(f"{i}. {mid}")
+        if lines_enum:
+            ack_line += "\n" + "\n".join(lines_enum)
+        if assistant_reply:
+            assistant_reply = ack_line + "\n" + assistant_reply
+        else:
+            assistant_reply = ack_line
     chat_store.update_session(req.session_id, {"lost_items": lost_state})
     # Persist each lost item to dedicated collection for MyPage listing
     try:
