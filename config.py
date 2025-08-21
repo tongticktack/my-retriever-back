@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     
     # prompt
     # Prompt bundle version (intent/extraction/guard). Set via env PROMPT_VERSION.
-    PROMPT_VERSION: int = 2
+    PROMPT_VERSION: int = 3
     # Default system prompt now upgraded to v3 (richer self-intro & structured style guidelines)
     SYSTEM_PROMPT_FILE: str = "app/prompts/system_prompt_v3.txt"
 

@@ -152,11 +152,15 @@ def _load_extraction_prompt() -> str:
         return ""
 
 def _load_multimodal_prompt() -> str:
-    path = Path("app/prompts/multimodal_extraction_v3.txt")
-    try:
-        return path.read_text(encoding="utf-8")
-    except Exception:
-        return ""
+    # Prefer newest v4 taxonomy-aware prompt; fallback to v3.
+    for fname in ["app/prompts/multimodal_extraction_v4.txt", "app/prompts/multimodal_extraction_v3.txt"]:
+        p = Path(fname)
+        if p.exists():
+            try:
+                return p.read_text(encoding="utf-8")
+            except Exception:
+                continue
+    return ""
 
 
 def _strict_llm_extract(user_text: str, current: Dict[str, str], image_urls: Optional[List[str]] = None) -> Dict[str, Any]:  # pragma: no cover (LLM)
