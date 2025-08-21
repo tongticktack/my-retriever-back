@@ -25,6 +25,7 @@ IDMAP_TEXT: List[str] = []
 
 from config import settings
 from . import embeddings
+from . import embeddings
 
 EMBED_DIM_IMAGE = settings.EMBEDDING_DIM_IMAGE
 EMBED_DIM_TEXT = settings.EMBEDDING_DIM_TEXT
@@ -119,7 +120,8 @@ def search_text(query_vec, k=5) -> List[Tuple[str, float, dict]]:
 
 
 def needs_reindex(current_version: str, provider: str) -> bool:
-    return current_version != settings.EMBEDDING_VERSION or provider != settings.EMBEDDING_PROVIDER
+    # Compare against effective provider actually in use (may fallback from configured one)
+    return current_version != settings.EMBEDDING_VERSION or provider != embeddings.current_provider()
 
 
 def reindex_all(force: bool = False):
@@ -144,7 +146,16 @@ def reindex_all(force: bool = False):
         if caption:
             text_vec = embeddings.embed_text(caption)
         # Cannot regenerate image embedding without raw image; skip image_vec
-        add_item(item_id, image_vec=None, text_vec=text_vec, meta={**meta, 'embedding_version': settings.EMBEDDING_VERSION, 'embedding_provider': settings.EMBEDDING_PROVIDER})
+        add_item(
+            item_id,
+            image_vec=None,
+            text_vec=text_vec,
+            meta={
+                **meta,
+                'embedding_version': settings.EMBEDDING_VERSION,
+                'embedding_provider': embeddings.current_provider(),
+            }
+        )
     save_all()
     return True
 

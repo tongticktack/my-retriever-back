@@ -28,6 +28,9 @@ if PROVIDER == "openai":
         if settings.OPENAI_API_KEY:
             openai.api_key = settings.OPENAI_API_KEY
             _openai_client = openai
+        else:
+            print("[embeddings] OPENAI_API_KEY missing → fallback to hash provider")
+            PROVIDER = "hash"
     except Exception as e:  # pragma: no cover
         print("[embeddings] OpenAI init failed, fallback to hash:", e)
         PROVIDER = "hash"
@@ -37,6 +40,9 @@ elif PROVIDER == "gemini":
         if settings.GEMINI_API_KEY:
             genai.configure(api_key=settings.GEMINI_API_KEY)
             _gemini_ready = True
+        else:
+            print("[embeddings] GEMINI_API_KEY missing → fallback to hash provider")
+            PROVIDER = "hash"
     except Exception as e:  # pragma: no cover
         print("[embeddings] Gemini init failed, fallback to hash:", e)
         PROVIDER = "hash"
@@ -91,6 +97,7 @@ def embed_text(text: str) -> np.ndarray:
 
 
 def current_provider() -> str:
+    """Return the effective provider actually generating vectors (after fallback)."""
     return PROVIDER
 
 def dims() -> tuple[int, int]:
