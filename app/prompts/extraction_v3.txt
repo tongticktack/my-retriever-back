@@ -7,7 +7,7 @@ owner:prompt-team
 분실물 관련 한국어 설명에서 구조화 JSON 추출기.
 
 [TARGET JSON KEYS]
-category, subcategory, color, lost_date, region
+category, subcategory, lost_date, region
 (불명확/부재 시 그 키 자체 생략; null/빈문자열 금지)
 
 [CATEGORY TAXONOMY]
@@ -50,8 +50,7 @@ subcategory 를 출력할 경우 반드시 위 [CATEGORY_SUBCATEGORY_MAP] 에서
 [FIELDS]
 category: 위 대분류 중 하나. 다중 후보/애매 → 생략.
 subcategory: 해당 대분류 하위 목록 중 명확한 1개. (규칙) subcategory 를 출력할 때는 반드시 category 도 함께 출력. 텍스트에 소분류 단서(브랜드/기기명 등)만 있고 category 미표기라도 그 소분류가 속한 category 를 채운다. 명확하지 않으면 둘 다 생략.
-color: 빨강/파랑/초록/검정/흰색/회색/노랑/갈색 중 대표 1개.
-region: 짧은 지명(최대 12자, 2~3토큰 이내). 사용자가 준 접미사(역/터미널 등) 보존.
+region: 사용자가 명시한 지명 그대로 (최대 12자, 2~3토큰). 내부 사전/목록에 없는 신규 지명도 그대로 채택 (목록 의존 금지). 지나치게 일반 단어("역", "근처", "주변" 단독)는 생략. 사용자가 붙인 접미사(역/터미널/공원 등) 보존.
 lost_date: 단일 확정 날짜만. 다수 후보/애매 → 생략.
 
 [PRIORITY]
@@ -59,13 +58,40 @@ lost_date: 단일 확정 날짜만. 다수 후보/애매 → 생략.
 
 [FEW-SHOT]
 입력: 어제 강남역에서 파란 아이폰 잃어버렸어요
-출력: {"category":"휴대폰","subcategory":"아이폰","color":"파랑","lost_date":"{YESTERDAY}","region":"강남역"}
+출력: {"category":"휴대폰","subcategory":"아이폰","lost_date":"{YESTERDAY}","region":"강남역"}
 
 입력: 3일 전 신촌에 검정 백팩
-출력: {"category":"가방","subcategory":"기타가방","color":"검정","lost_date":"{D3}","region":"신촌"}
+출력: {"category":"가방","subcategory":"기타가방","lost_date":"{D3}","region":"신촌"}
 
 입력: 지난주 강남역에서 흰색 맥북 두고 왔어요
-출력: {"category":"컴퓨터","subcategory":"애플노트북","color":"흰색","lost_date":"{D7}","region":"강남역"}
+출력: {"category":"컴퓨터","subcategory":"애플노트북","lost_date":"{D7}","region":"강남역"}
+
+입력: 어제
+출력: {"lost_date":"{YESTERDAY}"}
+
+입력: 신촌역
+출력: {"region":"신촌역"}
+
+입력: 아이폰 잃어버림
+출력: {"category":"휴대폰","subcategory":"아이폰"}
+
+입력: 휴대폰 혹은 지갑 중 하나 잃어버린 것 같아요
+출력: {}
+
+입력: 3일 전 강남에서 지갑
+출력: {"category":"지갑","subcategory":"기타 지갑","lost_date":"{D3}","region":"강남"}
+
+입력: 지난주쯤 홍대에서 무선 이어폰 케이스 잃어버렸습니다
+출력: {"category":"전자기기","subcategory":"무선이어폰","lost_date":"{D7}","region":"홍대"}
+
+입력: 어제 강남에서 잃어버린 것 같아요 (물건 종류 언급 없음)
+출력: {"lost_date":"{YESTERDAY}","region":"강남"}
+
+입력: (이전 추출: {"category":"휴대폰","subcategory":"아이폰","lost_date":"{YESTERDAY}","region":"아이폰을"}) 장소는 '아이폰을'이 아니라 성균관대역이야
+출력: {"category":"휴대폰","subcategory":"아이폰","lost_date":"{YESTERDAY}","region":"성균관대역"}
+
+입력: (현재: {"category":"지갑","subcategory":"기타 지갑","region":"강남"}) 지역은 강남 아니고 신촌역입니다
+출력: {"category":"지갑","subcategory":"기타 지갑","region":"신촌역"}
 
 [FAILSAFE]
 애매/무한국어 → {}

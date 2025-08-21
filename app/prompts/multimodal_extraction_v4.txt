@@ -7,7 +7,7 @@ owner:prompt-team
 사용자 한국어 설명 + 최대 3장 이미지로부터 분실물 핵심 필드 JSON 1개 추출.
 
 [OUTPUT KEYS]
-category, subcategory, color, lost_date, region (필수 후보) + (옵션) brand, material, pattern, notable_features, text_snippets, confidences
+category, subcategory, lost_date, region (필수 후보) + (옵션) brand, material, pattern, notable_features, text_snippets, confidences
 
 [CATEGORY TAXONOMY]
 category 허용 (20): 가방, 귀금속, 도서용품, 서류, 산업용품, 쇼핑백, 스포츠용품, 악기, 유가증권, 의류, 자동차, 전자기기, 지갑, 증명서, 컴퓨터, 카드, 현금, 휴대폰, 기타물품, 유류품
@@ -43,13 +43,12 @@ subcategory 를 포함하려면 반드시 위 map 내 정확 일치 문자열 �
 2. 허용 키 외 추가 금지. 값/항목 문자열 25자 이내.
 3. category 는 위 20개 중 확실 1개. 애매→생략.
 4. subcategory 는 해당 category 하위에서 확실할 때만. (규칙) subcategory 출력 시 map 기준 정확 일치 + 대응 category 동시 출력. 텍스트/이미지 소분류 단서만 있어도 map 통해 category 추론. 애매/사진만으로 불명확→둘 다 생략.
-5. color: 빨강/파랑/초록/검정/흰색/회색/노랑/갈색 중 대표 1개. 다색이면 가장 면적/주목도 높은 색.
 6. lost_date: 텍스트가 단일 상대/절대 날짜 제공 시만 YYYY-MM-DD. 이미지 단독 추정 금지.
-7. region: 텍스트 명시 지명(<=12자). 이미지 배경 추정 금지.
+7. region: 텍스트에 명시된 지명(<=12자). 내부 고정 목록 기대/의존 금지 (새 지명 그대로). 단일 일반어("역", "근처", "주변" 등)만 있으면 생략. 이미지 배경 추정 금지.
 8. brand/material/pattern 은 확신(confidences 값) 0.55 미만이면 필드 자체 생략 및 confidences에도 제외.
-9. confidences: 존재 필드(category, subcategory, color, brand, material, pattern)만 0~1 두 자리 float.
+9. confidences: 존재 필드(category, subcategory, brand, material, pattern)만 0~1 두 자리 float.
 10. 추측/창작 금지 (텍스트/이미지에 없는 모델명, 장소, 날짜, 브랜드 이름 생성 X).
-11. 텍스트 vs 이미지 충돌: 텍스트 우선. 단 color/category/subcategory 에서 이미지 confidence >=0.85 이고 텍스트와 명백히 상충 시 이미지값 채택 (텍스트 값 출력에서 제외).
+11. 텍스트 vs 이미지 충돌: 텍스트 우선. 단 category/subcategory 에서 이미지 confidence >=0.85 이고 텍스트와 명백히 상충 시 이미지값 채택 (텍스트 값 출력에서 제외).
 12. notable_features: 최대 5개 간결 구(형태/손상/로고 위치 등). text_snippets: 로고/라벨/인쇄된 짧은 문자열(최대4, PII 제외).
 13. PII(전화, 이메일, 주민번호 등) 절대 출력 금지.
 14. 모르는 값은 키 생략 (null, 빈 문자열, UNKNOWN 금지).
@@ -58,23 +57,44 @@ subcategory 를 포함하려면 반드시 위 map 내 정확 일치 문자열 �
 텍스트 명시 > 고신뢰 이미지(>=0.85) > 저신뢰 이미지(생략).
 
 [OUTPUT ORDER]
-category, subcategory, color, lost_date, region, brand, material, pattern, notable_features, text_snippets, confidences
+category, subcategory, lost_date, region, brand, material, pattern, notable_features, text_snippets, confidences
 
 [FEW-SHOT]
 예1: 텍스트 "어제 강남에서 흰색 아이폰" + 이미지 아이폰
-{"category":"휴대폰","subcategory":"아이폰","color":"흰색","lost_date":"{YESTERDAY}","region":"강남","confidences":{"category":0.95,"subcategory":0.93,"color":0.90}}
+{"category":"휴대폰","subcategory":"아이폰","lost_date":"{YESTERDAY}","region":"강남","confidences":{"category":0.95,"subcategory":0.93}}
 
 예2: 텍스트 "지난주 강남역에서 맥북" + 이미지 은색 노트북(애플 로고)
-{"category":"컴퓨터","subcategory":"애플노트북","color":"회색","lost_date":"{D7}","region":"강남역","confidences":{"category":0.96,"subcategory":0.92,"color":0.78,"brand":0.70}}
+{"category":"컴퓨터","subcategory":"애플노트북","lost_date":"{D7}","region":"강남역","confidences":{"category":0.96,"subcategory":0.92,"brand":0.70}}
 
 예3: 텍스트 "파란 가방 잃어버림" + 이미지 여성용 토트백 (파랑)
-{"category":"가방","subcategory":"여성용가방","color":"파랑","confidences":{"category":0.92,"subcategory":0.80,"color":0.83}}
+{"category":"가방","subcategory":"여성용가방","confidences":{"category":0.92,"subcategory":0.80}}
 
 예4: 텍스트 없음, 이미지: 검정 시계 (브랜드 불명)
-{"category":"귀금속","subcategory":"시계","color":"검정","confidences":{"category":0.88,"subcategory":0.76,"color":0.79}}
+{"category":"귀금속","subcategory":"시계","confidences":{"category":0.88,"subcategory":0.76}}
 
 예5: 텍스트 "3일 전 신촌에서 흰색 무선이어폰 케이스" + 이미지 AirPods 케이스 (brand conf 0.50)
-{"category":"전자기기","subcategory":"무선이어폰","color":"흰색","lost_date":"{D3}","region":"신촌","confidences":{"category":0.95,"subcategory":0.91,"color":0.88}}
+{"category":"전자기기","subcategory":"무선이어폰","lost_date":"{D3}","region":"신촌","confidences":{"category":0.95,"subcategory":0.91}}
+
+예6: 텍스트 "어제" + 이미지 휴대폰 사진 (이미지에서 아이폰 추정 가능)
+{"category":"휴대폰","subcategory":"아이폰","lost_date":"{YESTERDAY}","confidences":{"category":0.90,"subcategory":0.88}}
+
+예7: 텍스트 "신촌역" + 이미지 없음 (장소만 제공)
+{"region":"신촌역"}
+
+예8: 텍스트 없음 + 이미지: 검정 백팩
+{"category":"가방","subcategory":"기타가방","confidences":{"category":0.87,"subcategory":0.70}}
+
+예9: 텍스트 "지난주 홍대에서 지갑" + 이미지: 남성용 지갑 형태
+{"category":"지갑","subcategory":"기타 지갑","lost_date":"{D7}","region":"홍대","confidences":{"category":0.93,"subcategory":0.75}}
+
+예10: 텍스트 "휴대폰이나 태블릿 둘 중 하나 잃어버린듯" + 이미지 없음 (모호)
+{}
+
+예11: (이전 추출: {"category":"휴대폰","subcategory":"아이폰","lost_date":"{YESTERDAY}","region":"아이폰을"}) 텍스트 "장소는 '아이폰을'이 아니라 성균관대역"
+{"category":"휴대폰","subcategory":"아이폰","lost_date":"{YESTERDAY}","region":"성균관대역"}
+
+예12: (현재: {"category":"지갑","subcategory":"기타 지갑","region":"강남"}) 텍스트 "강남 아니고 신촌역입니다"
+{"category":"지갑","subcategory":"기타 지갑","region":"신촌역"}
 
 [FAILSAFE]
 파싱 실패/비한국어 → {}

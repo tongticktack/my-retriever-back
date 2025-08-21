@@ -64,30 +64,8 @@ SUBCATEGORY_SYNONYMS = {
     "지갑": ("지갑", "기타 지갑"),
 }
 
-COLORS = ["빨강", "파랑", "초록", "검정", "흰색", "회색", "노랑", "갈색"]
+## 색상(color) 관련 추출 비활성화: COLORS / COLOR_SYNONYMS / COLOR_PRIORITY 제거.
 
-# Synonym / alias normalization maps (simple, extend later)
-COLOR_SYNONYMS = {
-    "빨간": "빨강", "빨간색": "빨강", "레드": "빨강",
-    "파란": "파랑", "파란색": "파랑", "블루": "파랑", "청색": "파랑",
-    "초록색": "초록", "그린": "초록", "녹색": "초록",
-    "검은": "검정", "검은색": "검정", "블랙": "검정",
-    "화이트": "흰색", "하양": "흰색", "하얀": "흰색", "하얀색": "흰색",
-    "그레이": "회색", "회": "회색", "회색빛": "회색",
-    "노란": "노랑", "노란색": "노랑", "옐로": "노랑", "옐로우": "노랑",
-    "브라운": "갈색", "갈색의": "갈색"
-}
+# REGIONS / REGION_SYNONYMS 제거: 지역 인식은 정적 목록이 아닌 휴리스틱(_normalize_region) + LLM 지침에 의존.
 
-# Representative 색상 선정 우선순위 (첫 일치 사용)
-COLOR_PRIORITY = COLORS  # 현재는 정의된 순서를 그대로 활용
-
-REGIONS = [
-    # 핵심 기본 지명
-    "서울", "부산", "인천", "대구", "대전", "광주", "수원",
-    # 자주 등장하는 세부/생활 지명 및 접미 포함 변형 (접미사 보존 지침 반영)
-    "강남", "강남역", "홍대", "홍대입구", "신촌", "신촌역", "혜화역"
-]
-
-# REGION_SYNONYMS 제거: 프롬프트 지침(접미사 보존)에 맞춰 임의 축약 방지.
-
-REQUIRED_FIELDS = ["category", "subcategory", "color", "lost_date", "region"]
+REQUIRED_FIELDS = ["category", "subcategory", "lost_date", "region"]

@@ -17,6 +17,7 @@ from pathlib import Path
 from app.services import lost_item_extractor as li_ext
 from app.domain import lost_item_schema as schema
 from app.services.llm_providers import get_llm
+from app.services import external_search
 from config import settings
 
 DATE_ISO_RE = re.compile(r"20\d{2}-\d{2}-\d{2}$")
@@ -66,6 +67,26 @@ def _classify_intent_rule(text: str) -> str:
                 return "greeting"
         except Exception:
             continue
+    # Lightweight item heuristics: single/short tokens that look like category/subcategory/relative date/region supplement
+    hangul_only = re.sub(r"[^가-힣]", "", t)
+    token_count = len(re.split(r"\s+", t))
+    # relative date keywords
+    rel_date = any(kw in t for kw in ["어제","그제","그저께","3일 전","2일 전","지난주","일주일 전"])
+    # direct category/subcategory membership or typical endings (카드, 역, 대역)
+    if token_count <= 3:
+        from app.domain import lost_item_schema as _schema  # local import to avoid cycle
+        if any(cat == t for cat in _schema.PRIMARY_CATEGORIES):
+            return "item"
+        # flatten subcategories
+        if any(t == sub for subs in _schema.SUBCATEGORIES.values() for sub in subs):
+            return "item"
+        if rel_date:
+            return "item"
+        # endings suggesting region (역) or item type (카드, 폰, 지갑, 노트북)
+        if t.endswith("역") and len(t) >= 3:
+            return "item"
+        if any(t.endswith(suf) for suf in ["카드","폰","지갑","노트북"]):
+            return "item"
     return "other"
 
 
@@ -196,7 +217,7 @@ def _strict_llm_extract(user_text: str, current: Dict[str, str], image_urls: Opt
         for k, v in placeholders.items():
             system = system.replace('{'+k+'}', v)
     else:
-        system = "단일 JSON {category, subcategory, color, lost_date, region}; 없는 값 키 생략; today=" + today
+        system = "단일 JSON {category, subcategory, lost_date, region}; 없는 값 키 생략; today=" + today
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": system}
     ]
@@ -210,7 +231,7 @@ def _strict_llm_extract(user_text: str, current: Dict[str, str], image_urls: Opt
             parts.append({"type": "image_url", "image_url": {"url": url}})
         # 이미지만 있는 경우를 위해 최소 한개의 text guidance 추가 (추출 지시)
         if not user_text.strip():
-            parts.insert(0, {"type": "text", "text": "이미지에 보이는 분실물 정보를 category, subcategory, color, lost_date(모르면 빈칸), region(모르면 빈칸) JSON 추출"})
+            parts.insert(0, {"type": "text", "text": "이미지에 보이는 분실물 정보를 category, subcategory, lost_date(모르면 빈칸), region(모르면 빈칸) JSON 추출"})
         messages.append({"role": "user", "content": parts})
     else:
         messages.append({"role": "user", "content": user_text.strip()})
@@ -245,7 +266,7 @@ def _strict_llm_extract(user_text: str, current: Dict[str, str], image_urls: Opt
 
     def _clean(parsed: Dict[str, Any]) -> Dict[str, Any]:
         cleaned: Dict[str, Any] = {}
-        scalar_keys = ["category", "subcategory", "color", "lost_date", "region", "brand", "material", "pattern"]
+        scalar_keys = ["category", "subcategory", "lost_date", "region", "brand", "material", "pattern"]
         for k in scalar_keys:
             v = parsed.get(k)
             if isinstance(v, str):
@@ -321,10 +342,33 @@ def _strict_llm_extract(user_text: str, current: Dict[str, str], image_urls: Opt
     return {}
 
 
-def _merge_extracted(base: Dict[str, str], new: Dict[str, str]) -> Dict[str, str]:
-    for k, v in new.items():
-        if k not in base:
-            base[k] = v
+def _merge_extracted(base: Dict[str, str], new: Dict[str, str], *, allow_override: bool = False, override_keys: Optional[List[str]] = None) -> Dict[str, str]:
+    """Merge newly extracted fields into base.
+
+    Default: non-destructive (first value wins) to avoid oscillation.
+    If allow_override=True (e.g. explicit user correction at confirmation stage),
+    then keys in override_keys (or all keys if None) can be overwritten when new has a non-empty differing value.
+    """
+    if not new:
+        return base
+    if allow_override:
+        if override_keys is None:
+            override_keys = list(new.keys())
+        for k, v in new.items():
+            if not isinstance(v, str):
+                continue
+            if k in override_keys and v and v.strip():
+                # overwrite only if different
+                if base.get(k) != v:
+                    base[k] = v
+        # Ensure we still add missing keys (if override_keys limited)
+        for k, v in new.items():
+            if k not in base and isinstance(v, str):
+                base[k] = v
+    else:
+        for k, v in new.items():
+            if k not in base and isinstance(v, str):
+                base[k] = v
     return base
 
 
@@ -414,7 +458,7 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
             )
         elif count == 2:
             msg = (
-                "먼저 분실물 기본 정보(카테고리/색상/날짜/장소)가 필요해요. 예: '지난주 신촌에서 검정 백팩 잃어버렸어요' 처럼 알려주세요." )
+                "먼저 분실물 기본 정보(카테고리/날짜/장소)가 필요해요. 예: '지난주 신촌에서 백팩 잃어버렸어요' 처럼 알려주세요." )
         else:
             msg = "분실물 정보(예: 언제, 어디서, 어떤 물건)를 입력해주셔야 계속 도와드릴 수 있어요."
         return _persona_wrap(msg, 'ask'), lost_state, "intent:redirect", _snapshot(idx, current)
@@ -434,12 +478,22 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
     if current.get("stage") == "ready" and intent == 'confirm':
         current["stage"] = "confirmed"
         snapshot = _snapshot(idx, current)
-        return (
-            "검색 절차를 시작합니다. (경찰청 API 연동 예정) 다른 분실물도 계속 등록할 수 있어요. 새로 시작하려면 '새 물건'이라고 입력하세요.",
-            lost_state,
-            "lost-item-flow.v2",
-            snapshot,
-        )
+        # Run approximate external search now (after explicit user confirm)
+        search_msg = "공개 습득물 근사 검색을 시작합니다."
+        try:
+            matches = external_search.approximate_external_matches(current.get("extracted") or {}, max_results=5)
+            if matches:
+                current['external_matches'] = matches
+                summary_line = external_search.summarize_matches(matches, limit=3)
+                search_msg += "\n\n" + summary_line + "\n더 보고 싶으시면 '후보 자세히'라고 말씀해주세요."
+            else:
+                search_msg += "\n(현재 정보로 즉시 유사 후보 없음)"
+        except Exception as e:
+            print('[external_search] confirm-stage search failed', e)
+            search_msg += "\n(검색 중 오류가 발생했어요. 잠시 후 다시 시도해주세요.)"
+        search_msg += "\n다른 분실물을 새로 등록하려면 '새 물건'이라고 입력하시면 됩니다."
+        snapshot = _snapshot(idx, current)
+        return (search_msg, lost_state, "lost-item-flow.v2", snapshot)
     if current.get("stage") == "ready" and intent == 'cancel':
         current["stage"] = "collecting"
         # fall through to ask again
@@ -469,8 +523,37 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
         _log_metric('extraction.llm_call', missing=len(missing_before), ambiguity='1' if 'lost_date_candidates' in extracted else '0')
         llm_part = _strict_llm_extract(user_text, extracted, image_urls=image_urls)
         prev_keys = set(extracted.keys())
-        pre_values = {k: extracted.get(k) for k in ["category", "subcategory", "color"] if extracted.get(k)}
-        _merge_extracted(extracted, llm_part)
+        pre_values = {k: extracted.get(k) for k in ["category", "subcategory"] if extracted.get(k)}
+        # Detect explicit correction intent when at ready stage and user negates/overrules
+        correction_signal = False
+        is_ready_stage = current.get("stage") == "ready"
+        if is_ready_stage:
+            if re.search(r"(수정|정정|아니라|아닌|다시|틀렸|바꿔|변경|맞(?!.*않)|오타)", user_text):
+                correction_signal = True
+        # Implicit correction heuristic: short message providing a single differing field value
+        implicit = False
+        if is_ready_stage and not correction_signal and llm_part:
+            core_fields = ["category", "subcategory", "lost_date", "region"]
+            diffs = [f for f in core_fields if f in llm_part and f in extracted and llm_part[f] != extracted[f]]
+            # message length & token heuristics: very short or label-prefixed
+            text_len = len(user_text.strip())
+            token_count = len(re.split(r"\s+", user_text.strip())) if user_text.strip() else 0
+            label_prefix = bool(re.match(r"^(장소|지역|날짜|종류|카테고리|subcategory)[:\s]", user_text.strip()))
+            # avoid verbs indicating new narrative (잃, 찾, 분실 등) -> more likely new item
+            verb_like = re.search(r"(잃|찾|분실|도와|검색)", user_text)
+            if diffs and len(diffs) <= 2 and text_len <= 25 and token_count <= 5 and not verb_like:
+                implicit = True
+            elif diffs and label_prefix and not verb_like:
+                implicit = True
+        if implicit:
+            correction_signal = True
+        # Merge (allow override only for core fields during correction)
+        _merge_extracted(
+            extracted,
+            llm_part,
+            allow_override=correction_signal,
+            override_keys=["category", "subcategory", "lost_date", "region"]
+        )
         # Source tagging + conflict detection
         conflicts = current.get('conflicts') or {}
         vision_conf_map = {}
@@ -489,7 +572,7 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
                 if k not in prev_keys and k not in sources and k in extracted:
                     sources[k] = 'vision' if image_urls else 'llm'
             # Detect conflicts for core fields (text value retained unless override criteria)
-            for field in ["category", "subcategory", "color"]:
+            for field in ["category", "subcategory"]:
                 if field in llm_part and field in pre_values and llm_part[field] != pre_values[field]:
                     # store conflict structure
                     if field not in conflicts:
@@ -498,8 +581,8 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
                             'vision_value': llm_part[field],
                             'vision_confidence': vision_conf_map.get(field)
                         }
-            # Auto override rule (color only or also category/subcategory based on high confidence?)
-            for field in ["color", "category", "subcategory"]:
+            # Auto override rule (category/subcategory high confidence override)
+            for field in ["category", "subcategory"]:
                 if field in conflicts:
                     vc = conflicts[field].get('vision_confidence') or 0.0
                     if vc >= VISION_AUTO_OVERRIDE_THRESHOLD:
@@ -519,34 +602,12 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
         current["extracted"] = extracted
         current["missing"] = li_ext.compute_missing(extracted)
 
-    # If user provided explicit date resolving candidates
-    if "lost_date_candidates" in current.get("extracted", {}):
-        token = user_text.strip()
-        if DATE_ISO_RE.match(token):
-            current["extracted"]["lost_date"] = token
-            current["extracted"].pop("lost_date_candidates", None)
-            current["missing"] = li_ext.compute_missing(current["extracted"])
-        else:
-            # maybe user picked one candidate verbatim
-            cands = current["extracted"]["lost_date_candidates"].split(",")
-            for c in cands:
-                if c in user_text:
-                    current["extracted"]["lost_date"] = c
-                    current["extracted"].pop("lost_date_candidates", None)
-                    current["missing"] = li_ext.compute_missing(current["extracted"])
-                    break
-
-    # Decide next prompt
+    # Decide next prompt (date 후보 로직 제거)
     extracted = current.get("extracted", {})
-    if "lost_date_candidates" in extracted:
-        base = li_ext.build_missing_field_prompt(extracted, current.get("missing", []))
-        reply = _persona_wrap(base, 'disambiguate')
-        current["stage"] = "collecting"
-    else:
-        missing = current.get("missing", [])
-        if missing:
+    missing = current.get("missing", [])
+    if missing:
             # Determine next field
-            order = [f for f in ["category", "subcategory", "color", "lost_date", "region"] if f in missing]
+            order = [f for f in ["category", "subcategory", "lost_date", "region"] if f in missing]
             next_field = order[0] if order else None
             # Track ask attempts
             ask_counts = current.setdefault("ask_counts", {})
@@ -573,16 +634,16 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
             current["stage"] = "collecting"
             base = li_ext.build_missing_field_prompt(extracted, missing)
             reply = _persona_wrap(base, 'ask')
+    else:
+        if current.get("stage") != "confirmed":
+            current["stage"] = "ready"
+            confirmation = _build_confirmation_summary(extracted)
+            reply = _persona_wrap(confirmation, 'confirm')
+            if not current.get("media_ids") and not current.get("asked_photo"):
+                reply += "\n\n추가로 사진이 있다면 지금 최대 3장까지 올려주세요. 없으면 그냥 계속 말씀하거나 검색 진행 의사를 자연스럽게 표현해 주세요."
+                current["asked_photo"] = True
         else:
-            if current.get("stage") != "confirmed":
-                current["stage"] = "ready"
-                reply = _persona_wrap(_build_confirmation_summary(extracted), 'confirm')
-                # 사진 첨부 안내 (아직 이미지 없고 한 번도 묻지 않은 경우)
-                if not current.get("media_ids") and not current.get("asked_photo"):
-                    reply += "\n\n추가로 사진이 있다면 지금 최대 3장까지 올려주세요. 없으면 그냥 계속 말씀하거나 검색 진행 의사를 자연스럽게 표현해 주세요."
-                    current["asked_photo"] = True
-            else:
-                reply = None  # no need to say anything; allow general chat
+            reply = None  # no need to say anything; allow general chat
 
     snapshot = _snapshot(idx, current)
     # Optional final response guard polishing (only for replies we generated here)
@@ -617,8 +678,7 @@ def _build_confirmation_summary(extracted: Dict[str, Any]) -> str:
     cat = extracted.get('category'); sub = extracted.get('subcategory')
     if cat and sub: parts.append(f"종류: {cat} ({sub})")
     elif cat: parts.append(f"종류: {cat}")
-    col = extracted.get('color');
-    if col: parts.append(f"색상: {col}")
+    # 색상 출력 제거
     ld = extracted.get('lost_date');
     if ld: parts.append(f"날짜: {ld}")
     reg = extracted.get('region');
@@ -637,7 +697,7 @@ def _guess_field(extracted: Dict[str, str], field: str) -> str | None:  # pragma
     guidelines = {
         'category': '가능한 대분류 중 가장 가능성 높은 1개 (전자기기/의류/가방/지갑/액세서리).',
         'subcategory': '이미 category가 있다면 그 하위 소분류 중 가장 가능성 높은 1개.',
-        'color': '일반적으로 많이 쓰이는 현실적인 색상 1개 (검정/파랑/흰색 등).',
+    # 색상 항목 제거
         'lost_date': '최근 10일 이내의 날짜 중 합리적인 1개 (YYYY-MM-DD). 지나치게 임의 느낌 피하기.',
         'region': '한국 내 일반적인 지명 1개 (예: 강남, 신촌, 서울). 너무 상세 주소 피함.'
     }
@@ -716,8 +776,7 @@ def _style_enrich(draft: str, intent: str, item_snapshot: Dict[str, Any]) -> str
             examples = (
                 "원문: '정보 정리 중입니다.'\n"
                 "개선: '살짝 코를 킁킁하면서 정리 중이에요… 잠깐만 기다려주세요 🐾'\n\n"
-                "원문: '- 색상: 검정'\n"
-                "개선: '- 색상: 검정 (진한 느낌이네요!)'\n"
+                # 색상 관련 예시 제거 (색상 추출 비활성화)
             ) if CUTE_TONE_LEVEL >= 2 else ""
             intensity = {
                 1: "은은하고 절제된",
@@ -727,7 +786,7 @@ def _style_enrich(draft: str, intent: str, item_snapshot: Dict[str, Any]) -> str
             max_emoji = {1:1,2:3,3:4}.get(CUTE_TONE_LEVEL,3)
             tail_expr = {1:1,2:2,3:3}.get(CUTE_TONE_LEVEL,2)
             system = (
-                f"너는 분실물 도우미 '강아지' 캐릭터다. DRAFT를 더 따뜻하고 {intensity} 강아지스러운 말투로 재작성하되 사실/필드/숫자/날짜/색상은 절대 변형하지 마. "
+                f"너는 분실물 도우미 '강아지' 캐릭터다. DRAFT를 더 따뜻하고 {intensity} 강아지스러운 말투로 재작성하되 사실/필드/숫자/날짜는 절대 변형하지 마. "
                 "규칙:\n"
                 f"1) 말투: 부드러운 존댓말+살짝 귀여운 어미(~요, ~했어요, ~할게요). 과한 애교 금지.\n"
                 f"2) 강아지 표현(예: 꼬리 살랑, 코 킁킁, 열심히 찾아볼게요) 최대 {tail_expr}회.\n"
@@ -744,7 +803,7 @@ def _style_enrich(draft: str, intent: str, item_snapshot: Dict[str, Any]) -> str
             )
         else:
             system = (
-                "너는 답변 스타일 향상 모듈. 입력 초안(DRAFT)을 한국어로 더 자연스럽고 공감 있게 다듬되, 의미/사실/필드명/날짜/색상/카테고리 등 핵심 정보는 절대 삭제/왜곡하지 마. "
+                "너는 답변 스타일 향상 모듈. 입력 초안(DRAFT)을 한국어로 더 자연스럽고 공감 있게 다듬되, 의미/사실/필드명/날짜/카테고리 등 핵심 정보는 절대 삭제/왜곡하지 마. "
                 "규칙:\n"
                 "1) 목록/불릿/코드/JSON 구조 유지.\n"
                 "2) 과한 이모지 피하고 0~3개 이모지 허용.\n"

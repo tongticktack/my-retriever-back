@@ -59,27 +59,51 @@ def _resolve_relative_dates(text: str, today: date | None = None) -> List[str]:
     return candidates
 
 
-def _normalize_color(token: str) -> str | None:
-    if token in schema.COLORS:
-        return token
-    return schema.COLOR_SYNONYMS.get(token)
-
-
 def _normalize_region(token: str) -> str | None:
-    """Region normalization preserving user suffixes (역/터미널/공원 등).
-    Accept token if:
-      - Exact match in REGIONS, OR
-      - Ends with a common suffix and base (without suffix) is in REGIONS.
-    Returns token as-is (no shortening) to honor prompt rule.
+    """Heuristic region detection (no static whitelist) with extra guards.
+
+    추가 보호 이유: 이전 로직이 '아이폰을' 같은 품목+조사 결합을 장소로 잘못 인식.
+
+    Rules:
+        - Reject ultra-generic tokens: 역, 근처, 주변, 여기, 거기, 어디.
+        - Strip common postpositions (조사) at tail: 을/를/은/는/이/가/도/에/에서/으로/로 if length>2.
+        - Reject if stripped form matches (or 포함) 대표 품목 키워드 (폰, 노트북, 지갑, 가방, 백팩, 이어폰, 시계, 반지 등).
+        - Accept if token (or stripped) ends with place suffix (역, 터미널, 공원, 캠퍼스, 대학교, 시장, 공항, 항, 산, 강) and stem length >=2.
+        - Else accept if 2~6 pure Hangul AND not item keyword contaminated.
+        - Keep stripped form (without 조사) as region value.
     """
-    if token in schema.REGIONS:
-        return token
-    common_suffixes = ["역", "터미널", "공원", "캠퍼스", "대학교"]
-    for suf in common_suffixes:
-        if token.endswith(suf) and len(token) > len(suf):
-            base = token[:-len(suf)]
-            if base in schema.REGIONS:
-                return token  # keep original with suffix
+    raw = token.strip()
+    if not raw:
+        return None
+    generic = {"역", "근처", "주변", "여기", "거기", "어디"}
+    if raw in generic:
+        return None
+    # Strip common particles
+    particles_multi = ["에서", "으로"]
+    particles_single = ["을", "를", "은", "는", "이", "가", "도", "에", "로"]
+    stem = raw
+    for p in particles_multi:
+        if stem.endswith(p) and len(stem) > len(p)+1:  # ensure some stem
+            stem = stem[:-len(p)]
+            break
+    else:
+        if len(stem) > 2 and stem[-1] in particles_single:
+            stem = stem[:-1]
+    stem = stem.strip()
+    if not stem:
+        return None
+    # Reject obvious item tokens
+    item_keywords = {"폰", "휴대폰", "아이폰", "노트북", "맥북", "지갑", "가방", "백팩", "이어폰", "에어팟", "시계", "반지", "목걸이", "귀걸이"}
+    for kw in item_keywords:
+        if kw in stem:
+            return None
+    suffixes = ["역", "터미널", "공원", "캠퍼스", "대학교", "시장", "공항", "항", "산", "강"]
+    for suf in suffixes:
+        if stem.endswith(suf) and len(stem) > len(suf):
+            return stem
+    # pure Hangul short token 2~6 chars
+    if 2 <= len(stem) <= 6 and all('가' <= c <= '힣' for c in stem):
+        return stem
     return None
 
 
@@ -122,45 +146,18 @@ def _analyze_rule(user_text: str) -> Dict[str, str]:
                     break
             if "subcategory" in found:
                 break
-    # colors (collect all then choose representative)
+    # regions (synonyms); tokenize once (색상 제거로 간단화)
     tokens = re.split(r"[\s,./]+", text)
-    colors: List[str] = []
-    for tok in tokens:
-        norm_c = _normalize_color(tok)
-        if norm_c and norm_c not in colors:
-            colors.append(norm_c)
-    if colors:
-        # representative selection by priority order
-        rep = None
-        for p in schema.COLOR_PRIORITY:
-            if p in colors:
-                rep = p
-                break
-        found["color"] = rep or colors[0]
-        if len(colors) > 1:
-            found["color_all"] = ",".join(colors)
-    # regions (synonyms)
     for tok in tokens:
         norm_r = _normalize_region(tok)
         if norm_r:
+            # Skip overly generic tokens like just '역'
+            if norm_r == '역':
+                continue
             found["region"] = norm_r
             break
-    m = DATE_PAT.search(text)
-    if m:
-        y, mo, d = m.groups()
-        try:
-            dt = datetime(int(y), int(mo), int(d))
-            found["lost_date"] = dt.date().isoformat()
-        except Exception:
-            pass
-    if "lost_date" not in found:
-        rel_candidates = _resolve_relative_dates(text)
-        if rel_candidates:
-            if len(rel_candidates) == 1:
-                found["lost_date"] = rel_candidates[0]
-            else:
-                # store ambiguity as auxiliary key for later clarification
-                found["lost_date_candidates"] = ",".join(rel_candidates)
+    # 날짜는 LLM 추론에 위임: 규칙 기반 절대/상대 날짜 파싱 비활성화.
+    # (명시 YYYY-MM-DD 형태라 해도 여기서는 채우지 않고 LLM 일관 로직에 맡김)
     return found
 
 
@@ -182,69 +179,42 @@ def _validate(extracted: Dict[str, str]) -> Dict[str, str]:
                 out["category"] = c
                 out["subcategory"] = sub
                 break
-    color = extracted.get("color")
-    if color in schema.COLORS:
-        out["color"] = color
-    if "color_all" in extracted:
-        # keep raw list (filtered to known colors)
-        valid_multi = [c for c in extracted["color_all"].split(",") if c in schema.COLORS]
-        if len(valid_multi) > 1:
-            out["color_all"] = ",".join(valid_multi)
+    # 색상 관련 필드 제거 (color / color_all 무시)
     region = extracted.get("region")
     if region and len(region) <= 20:  # simple sanity
         out["region"] = region
     lost_date = extracted.get("lost_date")
     if lost_date and re.match(r"20\d{2}-\d{2}-\d{2}$", lost_date):
         out["lost_date"] = lost_date
-    # propagate candidate list if present and no final date chosen
-    if "lost_date" not in out and "lost_date_candidates" in extracted:
-        out["lost_date_candidates"] = extracted["lost_date_candidates"]
     return out
-
-
-## NOTE: LLM refinement & orchestration removed from this module.
-## Use extraction_controller for any advanced logic.
-
 
 def compute_missing(extracted: Dict[str, str]) -> List[str]:
     return [f for f in schema.REQUIRED_FIELDS if f not in extracted]
 
 
 def build_missing_field_prompt(extracted: Dict[str, str], missing: List[str]) -> str:
-    # Handle date ambiguity prompt
-    if "lost_date_candidates" in extracted:
-        cand = extracted["lost_date_candidates"].split(",")
-        return (
-            "날짜가 모호합니다. 아래 후보 중 하나를 선택하거나 정확한 날짜(YYYY-MM-DD)를 입력해주세요:\n" +
-            " / ".join(cand)
-        )
+    # 날짜 후보 브랜치 제거 (LLM 단일 추론)
     if not missing:
-        return "필요한 정보가 모두 수집되었습니다. 경찰청 검색을 진행할까요? (예/아니오)"
-    order = [f for f in ["category", "subcategory", "color", "lost_date", "region"] if f in missing]
+        return "필요한 정보가 모두 수집되었습니다. 검색을 진행할까요?"
+    order = [f for f in ["category", "subcategory", "lost_date", "region"] if f in missing]
     next_field = order[0]
-    friendly_map = {
-        "category": "대분류 (예: 전자기기/의류/가방/지갑/액세서리)",
-        "subcategory": "소분류 (예: 휴대폰/백팩 등)",
-        "color": "색상 (예: 검정, 파랑 등)",
-        "lost_date": "잃어버린 날짜 (예: 2025-08-15)",
-        "region": "지역 (예: 서울 강남, 홍대 등)",
-    }
-    context_lines: List[str] = []
-    # 친절하고 공감 있는 어조로 단일 항목 요청
-    context_lines.append("아직 몇 가지 정보가 더 필요해요.")
-    context_lines.append(f"먼저 {friendly_map[next_field]}를(을) 알려주실 수 있을까요?")
-    # 간단한 안내 문구 추가 (사용자가 헷갈리지 않도록)
-    if next_field == "lost_date":
-        context_lines.append("정확한 날짜를 모르시면 '어제', '3일 전' 처럼 말씀해도 괜찮아요.")
-    elif next_field == "region":
-        context_lines.append("지역은 너무 길지 않게 (예: 서울 강남 / 신촌) 정도로 적어주세요.")
+    # Free-form guidance replacing explicit enumeration
     if next_field == "category":
-        context_lines.append("가능한 대분류: " + ", ".join(schema.PRIMARY_CATEGORIES))
-    elif next_field == "subcategory" and extracted.get("category"):
-        context_lines.append("가능한 소분류: " + ", ".join(schema.SUBCATEGORIES.get(extracted["category"], [])))
-    elif next_field == "color":
-        context_lines.append("예시 색상: " + ", ".join(schema.COLORS[:6]))
-    return "\n".join(context_lines)
+        return (
+            "분실한 물건이 어떤 것인지 한두 단어 또는 짧은 구로 자연스럽게 묘사해 주세요. "
+            "예: '아이폰', '가죽 지갑', '노트북', '백팩'. 제가 그 설명으로 분류를 추론할게요."
+        )
+    if next_field == "subcategory":
+        return (
+            "조금 더 구체적으로 어떤 종류인지 적어주세요. 예: '아이폰', '여성용 지갑', '게이밍 노트북', '무선 이어폰'. "
+            "간단히 쓰셔도 제가 소분류를 추론합니다."
+        )
+    if next_field == "lost_date":
+        return ("잃어버린 날짜를 알려주세요. 정확한 날짜가 기억나지 않으면 '어제', '3일 전', '지난주' 처럼 표현해도 돼요.")
+    if next_field == "region":
+        return ("어디에서 잃어버렸는지 간단히 알려주세요. 예: '강남', '신촌역', '홍대'. 너무 긴 주소는 피하고 핵심 지명만 주세요.")
+    # Fallback (should not normally hit)
+    return "분실물 정보를 조금 더 알려주세요." 
 
 
 # build_llm_system_prompt: removed (deprecated & unused)

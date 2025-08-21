@@ -47,6 +47,7 @@ class SendMessageResponse(BaseModel):
     session_id: str
     # Optional debug state snippet for active lost item (not full state to keep payload small)
     active_lost_item: Optional[dict] = None
+    external_matches: Optional[List[dict]] = None  # added: approximate external Police/Portal matches
 
 class HistoryResponse(BaseModel):
     session_id: str
@@ -112,8 +113,8 @@ def send_message(req: SendMessageRequest):
     if "_img_cache" not in lost_state:
         lost_state["_img_cache"] = {}
     image_search_results = None
-    # Soft-fill color from image palette if any attachments and active collecting item missing color
-    majority_image_color = None
+    # 색상 추출 비활성화: 이미지 기반 색상 추론 제거
+    majority_image_color = None  # retained placeholder
     multi_image_conflict = False
     if user_meta and user_meta.get("attachments"):
         atts = user_meta.get("attachments")
@@ -147,38 +148,7 @@ def send_message(req: SendMessageRequest):
             pal = a.get("palette") or []
             if pal:
                 hex_candidates.append(pal[0])
-        # hex -> schema.COLORS 매핑 함수
-        def _hex_to_color(hx: str) -> str | None:
-            import re
-            m = re.match(r"#([0-9a-fA-F]{6})", hx or "")
-            if not m:
-                return None
-            rgbhex = m.group(1)
-            r = int(rgbhex[0:2],16); g = int(rgbhex[2:4],16); b = int(rgbhex[4:6],16)
-            if max(r,g,b) < 40:
-                return "검정"
-            if min(r,g,b) > 220:
-                return "흰색"
-            # dominant channel
-            if r > g and r > b:
-                return "빨강"
-            if g > r and g > b:
-                return "초록"
-            if b > r and b > g:
-                return "파랑"
-            # grayscale-ish
-            if abs(r-g) < 25 and abs(r-b) < 25:
-                return "회색"
-            return "갈색"
-        color_votes = {}
-        for hx in hex_candidates:
-            c = _hex_to_color(hx)
-            if c and c in schema.COLORS:
-                color_votes[c] = color_votes.get(c,0)+1
-        if color_votes:
-            # majority pick (stable tie by sorted name)
-            majority_image_color = sorted(color_votes.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
-        hex_color = hex_candidates[0] if hex_candidates else None
+    # 색상 계산 로직 제거 (hex_candidates는 다른 용도 없으므로 보류)
         # run similarity search for each attachment (최대 3), best top-score set 채택
         try:
             from app.services import faiss_index as _fi
@@ -228,24 +198,17 @@ def send_message(req: SendMessageRequest):
             lost_state["_img_cache"] = cache
         except Exception as e:
             print(f"[chat.image_search] error: {e}")
-    if majority_image_color and lost_state.get("active_index") is not None:
+    # merge media ids only (색상 세팅 제거)
+    if user_meta and user_meta.get("attachments") and lost_state.get("active_index") is not None:
         try:
             active = lost_state["items"][lost_state["active_index"]]
         except Exception:
             active = None
         if active:
-            # merge media ids
-            mid_list = [m.get("media_id") for m in atts if m.get("media_id")]
+            mid_list = [m.get("media_id") for m in user_meta.get("attachments") if m.get("media_id")]
             if mid_list:
                 existing = set(active.get("media_ids") or [])
                 active["media_ids"] = list(existing.union(mid_list))
-            extracted = active.get("extracted", {})
-            if "color" not in extracted:
-                extracted["color"] = majority_image_color
-                sources = active.get("sources") or {}
-                sources["color"] = "image-soft-fill-majority"
-                active["sources"] = sources
-                active["extracted"] = extracted
     user_lower = req.content.strip().lower()
     start_new_trigger = any(kw in user_lower for kw in ["또 잃어버렸", "다른 물건", "새 물건", "추가 물건"]) or user_lower.startswith("새 물건")
 
@@ -265,24 +228,7 @@ def send_message(req: SendMessageRequest):
             req.content, lost_state, start_new_trigger, image_urls=image_urls
         )
     # After extraction reconcile image-derived color vs extracted color if mismatch
-    try:
-        if majority_image_color and lost_state.get("active_index") is not None:
-            active = lost_state["items"][lost_state["active_index"]]
-            extracted = active.get("extracted") or {}
-            cur_color = extracted.get("color")
-            if cur_color and majority_image_color and cur_color != majority_image_color:
-                # Prefer image majority; keep old as alt_color
-                extracted.setdefault("alt_color_llm", cur_color)
-                extracted["color"] = majority_image_color
-                sources = active.get("sources") or {}
-                sources["color"] = "image-majority-override"
-                active["sources"] = sources
-                active["extracted"] = extracted
-                # notify user in reply (prepend note)
-                note = f"(이미지 다수결 색상이 LLM 추출 색상 '{cur_color}' 와 달라 '{majority_image_color}' 로 적용했습니다. 확인 부탁드립니다.)\n"
-                assistant_reply = note + (assistant_reply or "")
-    except Exception as e:
-        print(f"[chat.color_reconcile] error: {e}")
+    # 색상 reconcile 제거
     # If controller produced reply and we have similarity results, augment
     if assistant_reply and image_search_results:
         if image_search_results:
@@ -372,11 +318,36 @@ def send_message(req: SendMessageRequest):
     user_attachments = None
     if user_meta and user_meta.get("attachments"):
         user_attachments = user_meta.get("attachments")
+    # Collect external matches (trim fields) if present in active item
+    external_matches = None
+    try:
+        active_idx = lost_state.get("active_index")
+        if active_idx is not None:
+            active_item = (lost_state.get("items") or [])[active_idx]
+            raw_matches = active_item.get("external_matches")
+            if raw_matches:
+                trimmed = []
+                for m in raw_matches[:10]:  # cap
+                    trimmed.append({
+                        'atcId': m.get('atcId'),
+                        'collection': m.get('collection'),
+                        'itemCategory': m.get('itemCategory'),
+                        'itemName': m.get('itemName'),
+                        'foundDate': m.get('foundDate'),
+                        'storagePlace': m.get('storagePlace'),
+                        'imageUrl': m.get('imageUrl'),
+                        'score': m.get('score'),
+                    })
+                external_matches = trimmed
+    except Exception as e:
+        print(f"[chat.send] external_matches build error: {e}")
+
     return SendMessageResponse(
         session_id=req.session_id,
         user_message=Message(id=user_msg_id, role="user", content=req.content, created_at=created_at, model=None, attachments=user_attachments),
         assistant_message=Message(id=assistant_msg_id, role="assistant", content=assistant_reply, created_at=assistant_created_at, model=chosen_model, attachments=None),
         active_lost_item=active_item_snapshot,
+        external_matches=external_matches,
     )
 
 @router.get("/history/{session_id}", response_model=HistoryResponse)
