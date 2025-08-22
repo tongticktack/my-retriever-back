@@ -1,12 +1,10 @@
-"""Embedding service abstraction.
+"""Image embedding service abstraction (text embedding 제거).
 
-Supports providers:
-  - hash (deterministic local hashing; default / fallback)
-  - openai (text only for now)
-  - gemini (TODO: implement real API calls)
+지원 provider:
+    - hash (deterministic local hashing 기본)
+    - openai / gemini: 현재 실제 이미지 임베딩 미사용 시 hash fallback
 
-The FAISS index dimensions must match the vectors produced here. For dynamic
-model dims, either persist dims or detect at runtime before index creation.
+FAISS index 는 이제 이미지 벡터만 유지.
 """
 from __future__ import annotations
 import hashlib
@@ -18,34 +16,9 @@ from config import settings
 PROVIDER = settings.EMBEDDING_PROVIDER.lower()
 
 IMAGE_DIM = settings.EMBEDDING_DIM_IMAGE
-TEXT_DIM = settings.EMBEDDING_DIM_TEXT
 
-_openai_client = None
+_openai_client = None  # (보류: 이미지 전용 실제 모델 도입 시 확장)
 _gemini_ready = False
-if PROVIDER == "openai":
-    try:
-        import openai  # type: ignore
-        if settings.OPENAI_API_KEY:
-            openai.api_key = settings.OPENAI_API_KEY
-            _openai_client = openai
-        else:
-            print("[embeddings] OPENAI_API_KEY missing → fallback to hash provider")
-            PROVIDER = "hash"
-    except Exception as e:  # pragma: no cover
-        print("[embeddings] OpenAI init failed, fallback to hash:", e)
-        PROVIDER = "hash"
-elif PROVIDER == "gemini":
-    try:
-        import google.generativeai as genai  # type: ignore
-        if settings.GEMINI_API_KEY:
-            genai.configure(api_key=settings.GEMINI_API_KEY)
-            _gemini_ready = True
-        else:
-            print("[embeddings] GEMINI_API_KEY missing → fallback to hash provider")
-            PROVIDER = "hash"
-    except Exception as e:  # pragma: no cover
-        print("[embeddings] Gemini init failed, fallback to hash:", e)
-        PROVIDER = "hash"
 
 
 def _l2_normalize(vec: np.ndarray) -> np.ndarray:
@@ -69,36 +42,9 @@ def embed_image(image_bytes: bytes) -> np.ndarray:
     return _hash_to_vec(image_bytes, IMAGE_DIM)
 
 
-def embed_text(text: str) -> np.ndarray:
-    if PROVIDER == "hash":
-        return _hash_to_vec(text.encode("utf-8"), TEXT_DIM)
-    if PROVIDER == "gemini" and _gemini_ready:
-        try:
-            import google.generativeai as genai  # type: ignore
-            resp = genai.embed_content(model=settings.EMBEDDING_TEXT_MODEL, content=text)
-            vec = np.array(resp["embedding"], dtype="float32")  # type: ignore
-            return _l2_normalize(vec)
-        except Exception as e:  # pragma: no cover
-            print("[embeddings] Gemini text embed error, fallback hash:", e)
-            return _hash_to_vec(text.encode("utf-8"), TEXT_DIM)
-    if PROVIDER == "openai" and _openai_client is not None:
-        try:
-            resp = _openai_client.embeddings.create(
-                model=settings.OPENAI_EMBEDDING_MODEL,
-                input=text,
-                timeout=10,
-            )  # type: ignore
-            vec = np.array(resp.data[0].embedding, dtype="float32")  # type: ignore
-            return _l2_normalize(vec)
-        except Exception as e:  # pragma: no cover
-            print("[embeddings] OpenAI embed error, fallback hash:", e)
-            return _hash_to_vec(text.encode("utf-8"), TEXT_DIM)
-    return _hash_to_vec(text.encode("utf-8"), TEXT_DIM)
-
-
 def current_provider() -> str:
     """Return the effective provider actually generating vectors (after fallback)."""
     return PROVIDER
 
 def dims() -> tuple[int, int]:
-    return IMAGE_DIM, TEXT_DIM
+    return IMAGE_DIM, 0  # 텍스트 차원 제거

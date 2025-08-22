@@ -13,22 +13,17 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
 IMAGE_INDEX_PATH = DATA_DIR / "image.index"
-TEXT_INDEX_PATH = DATA_DIR / "text.index"
 META_PATH = DATA_DIR / "meta.json"
 IDMAP_IMAGE_PATH = DATA_DIR / "idmap_image.json"
-IDMAP_TEXT_PATH = DATA_DIR / "idmap_text.json"
 
 INDEX_LOCK = threading.RLock()
 META: Dict[str, dict] = {}
 IDMAP_IMAGE: List[str] = []  # position -> item_id
-IDMAP_TEXT: List[str] = []
 
 from config import settings
 from . import embeddings
-from . import embeddings
 
 EMBED_DIM_IMAGE = settings.EMBEDDING_DIM_IMAGE
-EMBED_DIM_TEXT = settings.EMBEDDING_DIM_TEXT
 EMBEDDING_VERSION = settings.EMBEDDING_VERSION
 
 
@@ -50,25 +45,22 @@ def _load_index(path: Path, dim: int):
 
 
 def load_all():
-    global IMAGE_INDEX, TEXT_INDEX, META, IDMAP_IMAGE, IDMAP_TEXT
+    global IMAGE_INDEX, META, IDMAP_IMAGE, IDMAP_TEXT
     with INDEX_LOCK:
         IMAGE_INDEX = _load_index(IMAGE_INDEX_PATH, EMBED_DIM_IMAGE)
-        TEXT_INDEX = _load_index(TEXT_INDEX_PATH, EMBED_DIM_TEXT)
     META = json.loads(META_PATH.read_text("utf-8")) if META_PATH.exists() else {}
     IDMAP_IMAGE = json.loads(IDMAP_IMAGE_PATH.read_text("utf-8")) if IDMAP_IMAGE_PATH.exists() else []
-    IDMAP_TEXT = json.loads(IDMAP_TEXT_PATH.read_text("utf-8")) if IDMAP_TEXT_PATH.exists() else []
+    IDMAP_TEXT = []  # 텍스트 인덱스 제거
 
 
 def save_all():
     with INDEX_LOCK:
         _save_index(IMAGE_INDEX, IMAGE_INDEX_PATH)
-        _save_index(TEXT_INDEX, TEXT_INDEX_PATH)
         META_PATH.write_text(json.dumps(META, ensure_ascii=False, indent=2), "utf-8")
         IDMAP_IMAGE_PATH.write_text(json.dumps(IDMAP_IMAGE, ensure_ascii=False, indent=2), "utf-8")
-        IDMAP_TEXT_PATH.write_text(json.dumps(IDMAP_TEXT, ensure_ascii=False, indent=2), "utf-8")
 
 
-def add_item(item_id: str, image_vec, text_vec, meta: dict):
+def add_item(item_id: str, image_vec, text_vec, meta: dict):  # text_vec deprecated
     with INDEX_LOCK:
         # FAISS는 numpy float32 배열 필요
         import numpy as np
@@ -76,10 +68,6 @@ def add_item(item_id: str, image_vec, text_vec, meta: dict):
             image_arr = np.array([image_vec], dtype='float32')
             IMAGE_INDEX.add(image_arr)
             IDMAP_IMAGE.append(item_id)
-        if text_vec is not None:
-            text_arr = np.array([text_vec], dtype='float32')
-            TEXT_INDEX.add(text_arr)
-            IDMAP_TEXT.append(item_id)
         META[item_id] = meta
 
 
@@ -101,22 +89,8 @@ def search_image(query_vec, k=5) -> List[Tuple[str, float, dict]]:
         return results
 
 
-def search_text(query_vec, k=5) -> List[Tuple[str, float, dict]]:
-    import numpy as np
-    with INDEX_LOCK:
-        if TEXT_INDEX.ntotal == 0:
-            return []
-        q = np.array([query_vec], dtype='float32')
-        scores, idxs = TEXT_INDEX.search(q, k)
-        results = []
-        for score, idx in zip(scores[0], idxs[0]):
-            if idx == -1:
-                continue
-            if idx >= len(IDMAP_TEXT):
-                continue
-            item_id = IDMAP_TEXT[idx]
-            results.append((item_id, float(score), META[item_id]))
-        return results
+def search_text(*_args, **_kwargs):  # 유지: 기존 API 호출 시 빈 결과 반환
+    return []
 
 
 def needs_reindex(current_version: str, provider: str) -> bool:
@@ -135,21 +109,16 @@ def reindex_all(force: bool = False):
     ):
         return False
     # Recreate indices
-    global IMAGE_INDEX, TEXT_INDEX, IDMAP_IMAGE, IDMAP_TEXT
+    global IMAGE_INDEX, IDMAP_IMAGE, IDMAP_TEXT
     IMAGE_INDEX = _create_flat_index(EMBED_DIM_IMAGE)
-    TEXT_INDEX = _create_flat_index(EMBED_DIM_TEXT)
     IDMAP_IMAGE = []
     IDMAP_TEXT = []
     for item_id, meta in META.items():
-        caption = meta.get('caption','')
-        text_vec = None
-        if caption:
-            text_vec = embeddings.embed_text(caption)
-        # Cannot regenerate image embedding without raw image; skip image_vec
+        # 텍스트 인덱스 제거: caption 기반 재생성 스킵, 메타만 업데이트
         add_item(
             item_id,
             image_vec=None,
-            text_vec=text_vec,
+            text_vec=None,
             meta={
                 **meta,
                 'embedding_version': settings.EMBEDDING_VERSION,

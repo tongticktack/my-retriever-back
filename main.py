@@ -88,8 +88,8 @@ def root():
         "/chat/session",
         "/chat/send",
         "/chat/history/{session_id}",
-    "/lost/analyze",
-    "/media/upload"
+        "/lost/analyze",
+        "/media/upload"
     ]}
 
 

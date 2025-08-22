@@ -23,14 +23,12 @@ class Settings(BaseSettings):
     # OpenAI
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_MODEL_NAME: str = "gpt-4o-mini"
-    OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"  # 텍스트 임베딩 (OpenAI 사용 시)
+    # (텍스트 임베딩 제거됨)
     
-    # Embeddings (이미지/텍스트 공통)
-    EMBEDDING_PROVIDER: str = "hash"  # hash | gemini | openai
-    EMBEDDING_IMAGE_MODEL: str = "gemini-1.5-flash"  # (추후 멀티모달 임베딩 모델명 교체 가능)
-    EMBEDDING_TEXT_MODEL: str = "text-embedding-004"  # AI Studio 텍스트 임베딩
-    EMBEDDING_DIM_IMAGE: int = 512  # 해시 기본값 (실제 모델 사용 시 런타임 감지 가능)
-    EMBEDDING_DIM_TEXT: int = 768
+    # Image embedding (텍스트/멀티모달 제거 후 단일 이미지 벡터만 사용)
+    EMBEDDING_PROVIDER: str = "hash"  # hash | gemini | openai (텍스트 경로 제거)
+    EMBEDDING_IMAGE_MODEL: str = "gemini-1.5-flash"  # (필요 시 교체 예정)
+    EMBEDDING_DIM_IMAGE: int = 512
     EMBEDDING_VERSION: str = "v1"
 
     # Multi-image distinct object detection threshold (cosine similarity)
