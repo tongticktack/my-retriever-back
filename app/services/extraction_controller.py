@@ -534,7 +534,7 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
             if matches:
                 current['external_matches'] = matches
                 summary_line = external_search.summarize_matches(matches, limit=3)
-                search_msg += "\n\n" + summary_line + "\n더 보고 싶으시면 '후보 자세히'라고 말씀해주세요."
+                search_msg += "\n\n" + summary_line
             else:
                 search_msg += "\n(현재 정보로 즉시 유사 후보 없음)"
         except Exception as e:

@@ -312,7 +312,7 @@ def send_message(req: SendMessageRequest):
     try:
         session_user = session_doc.get("user_id") if session_doc else None
         user_for_items = (req.user_id or session_user or "guest")
-        lost_item_store.bulk_upsert(user_for_items, req.session_id, lost_state.get("items", []))
+        lost_item_store.bulk_upsert(user_for_items, lost_state.get("items", []))
     except Exception as e:
         print(f"[lost_item_store] bulk_upsert error: {e}")
 
