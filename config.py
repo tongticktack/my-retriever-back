@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     
     # Image embedding (OpenAI 단일 사용; 미지원 시 hash fallback)
     EMBEDDING_PROVIDER: str = "openai"  # openai (기본) | hash (fallback)
+    EMBEDDING_IMAGE_MODEL: str = "clip-vit-b32"  # sentence-transformers 모델명 (예: clip-vit-b32, clip-vit-b16)
     EMBEDDING_DIM_IMAGE: int = 512
     EMBEDDING_VERSION: str = "v1"
 
