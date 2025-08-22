@@ -385,28 +385,7 @@ def send_message(req: SendMessageRequest):
 
     # Do NOT merge image similarity into matches (rollback behavior)
 
-    # Append markdown links for public lost item pages (lost112 proxy)
-    try:
-        link_ids: List[str] = []
-        # Prefer image similarity result ids (actId) if available
-        if image_search_results:
-            for _iid, _score, _meta in image_search_results:
-                if isinstance(_meta, dict):
-                    act_id = _meta.get('actId') or _meta.get('act_id') or _meta.get('id')
-                    if act_id and act_id not in link_ids:
-                        link_ids.append(str(act_id))
-        # If none from image similarity, fall back to matches list
-        if not link_ids and matches:
-            for m in matches[:5]:  # limit to first 5
-                act_id = m.get('atcId') or m.get('actId') or m.get('id')
-                if act_id and act_id not in link_ids:
-                    link_ids.append(str(act_id))
-        if link_ids:
-            # Use internal proxy GET endpoint so browser can just follow link; server will POST upstream.
-            lines = [f"- [ACT_ID {aid}](/proxy/lost112/{aid})" for aid in link_ids]
-            assistant_reply += "\n\n관련 분실물 링크:\n" + "\n".join(lines)
-    except Exception as e:
-        print(f"[chat.send] link build error: {e}")
+    # Removed: proxy link markdown injection (요청에 따라 링크 제공 X)
 
     return SendMessageResponse(
         session_id=req.session_id,

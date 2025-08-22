@@ -1,8 +1,6 @@
 import firebase_admin
 import json
 from fastapi import FastAPI, Request
-from fastapi import Form, Response, HTTPException
-import httpx
 from firebase_admin import credentials
 
 from config import settings
@@ -101,12 +99,4 @@ def admin_reindex(force: bool = False):
     return {"reindexed": changed, "embedding_version": faiss_index.EMBEDDING_VERSION}
 
 
-async def _fetch_lost112(act_id: str, fd_sn: str = "1") -> Response:
-    target_url = "https://www.lost112.go.kr/find/findDetail.do"
-    data = {"ACT_ID": act_id, "FD_SN": fd_sn}
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(target_url, data=data)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"proxy_error: {e}")
-    return Response(content=resp.text, media_type="text/html", status_code=resp.status_code)
+# Removed lost112 proxy helper per request (no proxy endpoints exposed)
