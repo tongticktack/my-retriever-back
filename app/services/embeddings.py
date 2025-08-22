@@ -14,6 +14,7 @@ from typing import Optional
 import numpy as np
 import io
 from PIL import Image
+from config import settings
 
 _model = None
 _model_dim: Optional[int] = None

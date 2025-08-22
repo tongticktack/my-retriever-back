@@ -21,7 +21,7 @@ MAX_MEDIA_PER_MESSAGE = 3  # allow up to 3 images per user message
 MULTI_IMAGE_MIN_INTERNAL_SIMILARITY = getattr(settings, 'MULTI_IMAGE_MIN_INTERNAL_SIMILARITY', 0.45)
 
 class CreateSessionRequest(BaseModel):
-    user_id: Optional[str] = None
+    user_id: str
 
 class CreateSessionResponse(BaseModel):
     session_id: str
@@ -47,7 +47,7 @@ class SendMessageResponse(BaseModel):
     session_id: str
     # Optional debug state snippet for active lost item (not full state to keep payload small)
     active_lost_item: Optional[dict] = None
-    external_matches: Optional[List[dict]] = None  # added: approximate external Police/Portal matches
+    matches: Optional[List[dict]] = None  # unified list: external or internal (image/text) candidates
 
 class HistoryResponse(BaseModel):
     session_id: str
@@ -118,7 +118,7 @@ def send_message(req: SendMessageRequest):
     multi_image_conflict = False
     if user_meta and user_meta.get("attachments"):
         atts = user_meta.get("attachments")
-        # Distinct-object heuristic: pairwise embedding similarity check
+        # Distinct-object heuristic first (same as before)
         if len(atts) > 1:
             embs = []
             try:
@@ -129,7 +129,6 @@ def send_message(req: SendMessageRequest):
                     emb = media_store.get_embedding(mid)
                     if emb is not None:
                         embs.append((mid, emb))
-                # pairwise min similarity
                 def _dot(u,v):
                     return sum(x*y for x,y in zip(u,v)) / ( (sum(x*x for x in u)**0.5) * (sum(y*y for y in v)**0.5) + 1e-9 )
                 min_sim = 1.0
@@ -142,62 +141,6 @@ def send_message(req: SendMessageRequest):
                     multi_image_conflict = True
             except Exception as e:
                 print(f"[chat.multi_image_conflict_check] error: {e}")
-        # 수집된 팔레트들을 기반으로 대표 hex 후보 집계
-        hex_candidates = []
-        for a in atts[:MAX_MEDIA_PER_MESSAGE]:
-            pal = a.get("palette") or []
-            if pal:
-                hex_candidates.append(pal[0])
-    # 색상 계산 로직 제거 (hex_candidates는 다른 용도 없으므로 보류)
-        # run similarity search for each attachment (최대 3), best top-score set 채택
-        try:
-            from app.services import faiss_index as _fi
-            cache = lost_state.get("_img_cache") or {}
-            best = None
-            best_score = -1.0
-            active_index = lost_state.get("active_index")
-            for idx, att in enumerate(atts[:MAX_MEDIA_PER_MESSAGE]):
-                mid = att.get("media_id")
-                if not mid:
-                    continue
-                emb = media_store.get_embedding(mid)
-                if emb is None:
-                    continue
-                if active_index is not None:
-                    item_key = f"lost_{req.session_id}_{active_index}_{idx}"
-                    meta_kind = {"type":"lost_item","session_id":req.session_id,"active_index":active_index,"media_id":mid,"img_slot":idx}
-                else:
-                    item_key = f"media_{mid}_{idx}"
-                    meta_kind = {"type":"media","session_id":req.session_id,"media_id":mid,"img_slot":idx}
-                if item_key not in _fi.META:
-                    _fi.add_item(item_key, emb, None, meta_kind)
-                    try:
-                        _fi.save_all()
-                    except Exception as se:
-                        print(f"[faiss.save_all] warn: {se}")
-                cached = cache.get(mid)
-                if cached is not None:
-                    cand = cached
-                else:
-                    raw = _fi.search_image(emb, k=IMAGE_SIMILARITY_TOP_K + 1)
-                    filtered = []
-                    for iid, score, meta in raw:
-                        if iid == item_key:
-                            continue
-                        if score < IMAGE_SIMILARITY_THRESHOLD:
-                            continue
-                        filtered.append((iid, score, meta))
-                        if len(filtered) >= IMAGE_SIMILARITY_TOP_K:
-                            break
-                    cand = filtered if filtered else None
-                    cache[mid] = cand
-                if cand and cand[0][1] > best_score:
-                    best_score = cand[0][1]
-                    best = cand
-            image_search_results = best
-            lost_state["_img_cache"] = cache
-        except Exception as e:
-            print(f"[chat.image_search] error: {e}")
     # merge media ids only (색상 세팅 제거)
     if user_meta and user_meta.get("attachments") and lost_state.get("active_index") is not None:
         try:
@@ -227,6 +170,65 @@ def send_message(req: SendMessageRequest):
         assistant_reply, lost_state, chosen_model, active_item_snapshot = extc.process_message(
             req.content, lost_state, start_new_trigger, image_urls=image_urls
         )
+    # After extraction: run metadata-based candidate filtering + image similarity (lazy) if user supplied images
+    if (assistant_reply is not None) and user_meta and user_meta.get("attachments") and not multi_image_conflict:
+        try:
+            from app.services import faiss_index as _fi
+            # Build candidate id set based on extracted info (category, region)
+            active_idx = lost_state.get("active_index")
+            extracted = None
+            if active_idx is not None:
+                try:
+                    extracted = (lost_state.get("items") or [])[active_idx].get("extracted") or {}
+                except Exception:
+                    extracted = {}
+            cat = (extracted.get("category") or "").strip().lower() if extracted else ""
+            region = (extracted.get("region") or "").strip().lower() if extracted else ""
+            candidates = []
+            for iid, meta in _fi.META.items():
+                # Skip ephemeral session-added entries (we tagged with type)
+                if isinstance(meta, dict) and meta.get("type") in {"media","lost_item"}:
+                    continue
+                if not isinstance(meta, dict):
+                    continue
+                mcat = str(meta.get("category","")) .lower()
+                if cat and cat not in mcat:
+                    continue
+                if region:
+                    place = str(meta.get("found_place","")) .lower()
+                    if region not in place:
+                        continue
+                candidates.append(iid)
+            # If no candidates found, fall back to whole index (will be filtered by threshold later)
+            candidate_set = set(candidates) if candidates else None
+            cache = lost_state.get("_img_cache") or {}
+            best = None
+            best_score = -1.0
+            atts = user_meta.get("attachments")
+            for idx, att in enumerate(atts[:MAX_MEDIA_PER_MESSAGE]):
+                mid = att.get("media_id")
+                if not mid:
+                    continue
+                emb = media_store.get_embedding(mid)
+                if emb is None:
+                    continue
+                # Query broader then filter
+                raw = _fi.search_image(emb, k= max(IMAGE_SIMILARITY_TOP_K*4, IMAGE_SIMILARITY_TOP_K+10))
+                filtered = []
+                for iid, score, meta in raw:
+                    if candidate_set and iid not in candidate_set:
+                        continue
+                    if score < IMAGE_SIMILARITY_THRESHOLD:
+                        continue
+                    filtered.append((iid, score, meta))
+                    if len(filtered) >= IMAGE_SIMILARITY_TOP_K:
+                        break
+                if filtered and filtered[0][1] > best_score:
+                    best_score = filtered[0][1]
+                    best = filtered
+            image_search_results = best
+        except Exception as e:
+            print(f"[chat.image_search.meta] error: {e}")
     # After extraction reconcile image-derived color vs extracted color if mismatch
     # 색상 reconcile 제거
     # If controller produced reply and we have similarity results, augment
@@ -253,7 +255,6 @@ def send_message(req: SendMessageRequest):
         attachments_list = user_meta.get("attachments")
         count_imgs = len(attachments_list)
         ack_line = f"이미지 {count_imgs}장 확인했습니다."
-        # enumerate each image id 1,2,3 ...
         lines_enum = []
         for i, a in enumerate(attachments_list, start=1):
             mid = a.get("media_id") or "-"
@@ -265,16 +266,13 @@ def send_message(req: SendMessageRequest):
         else:
             assistant_reply = ack_line
     chat_store.update_session(req.session_id, {"lost_items": lost_state})
-    # Persist each lost item to dedicated collection for MyPage listing
     try:
-        # user_id 가 세션에 있을 수도 있고 요청에 있을 수도 있음
         session_user = session_doc.get("user_id") if session_doc else None
         user_for_items = (req.user_id or session_user or "guest")
         lost_item_store.bulk_upsert(user_for_items, req.session_id, lost_state.get("items", []))
     except Exception as e:
         print(f"[lost_item_store] bulk_upsert error: {e}")
 
-    # lost-item 로직에서 assistant_reply 생성되면 LLM 생략
     if assistant_reply is None:
         llm = get_llm()
         provider_messages = build_messages(req.session_id, req.content, retrieval_items=None, law_summary=None)
@@ -283,7 +281,6 @@ def send_message(req: SendMessageRequest):
         except Exception as e:
             assistant_reply = f"(llm-error) {str(e)[:120]}"
         chosen_model = getattr(llm, "last_model_name", None) or getattr(llm, "model", None) or getattr(llm, "name", "unknown")
-    # else chosen_model already set by controller
 
     assistant_meta = {"model": chosen_model}
     assistant_msg_id = chat_store.add_message(
@@ -318,16 +315,16 @@ def send_message(req: SendMessageRequest):
     user_attachments = None
     if user_meta and user_meta.get("attachments"):
         user_attachments = user_meta.get("attachments")
-    # Collect external matches (trim fields) if present in active item
-    external_matches = None
+    # Build matches list (external first, then internal text-fallback)
+    matches = None
     try:
         active_idx = lost_state.get("active_index")
         if active_idx is not None:
             active_item = (lost_state.get("items") or [])[active_idx]
-            raw_matches = active_item.get("external_matches")
+            raw_matches = active_item.get("external_matches") if active_item else None
             if raw_matches:
                 trimmed = []
-                for m in raw_matches[:10]:  # cap
+                for m in raw_matches[:10]:
                     trimmed.append({
                         'atcId': m.get('atcId'),
                         'collection': m.get('collection'),
@@ -338,16 +335,82 @@ def send_message(req: SendMessageRequest):
                         'imageUrl': m.get('imageUrl'),
                         'score': m.get('score'),
                     })
-                external_matches = trimmed
+                matches = trimmed
+            if matches is None and not (user_meta and user_meta.get("attachments")):
+                extracted = active_item.get("extracted") if active_item else None
+                if extracted and (extracted.get("category") or extracted.get("region")):
+                    from app.services import faiss_index as _fi
+                    cat_q = (extracted.get("category") or "").lower().strip()
+                    region_q = (extracted.get("region") or "").lower().strip()
+                    candidates = []
+                    for iid, meta in _fi.META.items():
+                        if not isinstance(meta, dict):
+                            continue
+                        if meta.get("type") in {"media","lost_item"}:
+                            continue
+                        mcat = str(meta.get("category") or "").lower()
+                        if cat_q and cat_q not in mcat:
+                            continue
+                        mplace = str(meta.get("found_place") or "").lower()
+                        region_ok = True
+                        if region_q:
+                            region_ok = (region_q in mplace)
+                        if not region_ok:
+                            continue
+                        score = 0.0
+                        if cat_q:
+                            score += 0.7
+                        if region_q and region_ok:
+                            score += 0.3
+                        candidates.append((iid, score, meta))
+                    def _ts(meta):
+                        return meta.get('created_at') or meta.get('createdAt') or ''
+                    candidates.sort(key=lambda x: (x[1], _ts(x[2])), reverse=True)
+                    trimmed = []
+                    for iid, score, meta in candidates[:10]:
+                        trimmed.append({
+                            'atcId': meta.get('actId') or meta.get('id') or iid,
+                            'collection': 'internal-text',
+                            'itemCategory': meta.get('category'),
+                            'itemName': meta.get('caption') or meta.get('notes') or meta.get('category'),
+                            'foundDate': meta.get('found_time'),
+                            'storagePlace': meta.get('found_place'),
+                            'imageUrl': None,
+                            'score': round(score, 3),
+                        })
+                    if trimmed:
+                        matches = trimmed
     except Exception as e:
-        print(f"[chat.send] external_matches build error: {e}")
+        print(f"[chat.send] matches build error: {e}")
+
+    # Append markdown links for public lost item pages (lost112)
+    try:
+        link_ids: List[str] = []
+        # Prefer image similarity result ids (actId) if available
+        if image_search_results:
+            for _iid, _score, _meta in image_search_results:
+                if isinstance(_meta, dict):
+                    act_id = _meta.get('actId') or _meta.get('act_id') or _meta.get('id')
+                    if act_id and act_id not in link_ids:
+                        link_ids.append(str(act_id))
+        # If none from image similarity, fall back to matches list
+        if not link_ids and matches:
+            for m in matches[:5]:  # limit to first 5
+                act_id = m.get('atcId') or m.get('actId') or m.get('id')
+                if act_id and act_id not in link_ids:
+                    link_ids.append(str(act_id))
+        if link_ids:
+            lines = [f"- [ACT_ID {aid}](https://lost112.go.kr/find/findDetail.do?ACT_ID={aid}&FD_SN=1)" for aid in link_ids]
+            assistant_reply += "\n\n관련 분실물 링크:\n" + "\n".join(lines)
+    except Exception as e:
+        print(f"[chat.send] link build error: {e}")
 
     return SendMessageResponse(
         session_id=req.session_id,
         user_message=Message(id=user_msg_id, role="user", content=req.content, created_at=created_at, model=None, attachments=user_attachments),
         assistant_message=Message(id=assistant_msg_id, role="assistant", content=assistant_reply, created_at=assistant_created_at, model=chosen_model, attachments=None),
         active_lost_item=active_item_snapshot,
-        external_matches=external_matches,
+        matches=matches,
     )
 
 @router.get("/history/{session_id}", response_model=HistoryResponse)

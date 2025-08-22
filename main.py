@@ -1,6 +1,8 @@
 import firebase_admin
 import json
 from fastapi import FastAPI, Request
+from fastapi import Form, Response, HTTPException
+import httpx
 from firebase_admin import credentials
 
 from config import settings
@@ -97,4 +99,20 @@ def root():
 def admin_reindex(force: bool = False):
     changed = faiss_index.reindex_all(force=force)
     return {"reindexed": changed, "embedding_version": faiss_index.EMBEDDING_VERSION}
+
+
+@app.post("/proxy/lost112")
+async def proxy_lost112(act_id: str = Form(...), fd_sn: str = Form("1")):
+    """Server-side POST proxy to lost112 detail (browser can't send body via simple link).
+    Returns raw HTML so frontend can open in new window or render in iframe.
+    """
+    target_url = "https://www.lost112.go.kr/find/findDetail.do"
+    data = {"ACT_ID": act_id, "FD_SN": fd_sn}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(target_url, data=data)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"proxy_error: {e}")
+    # Pass through status (treat non-200 as upstream issue still returning body)
+    return Response(content=resp.text, media_type="text/html", status_code=resp.status_code)
 

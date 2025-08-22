@@ -13,6 +13,7 @@ async def ingest_item(
     found_place: str | None = Form(None),
     found_time: str | None = Form(None),
     notes: str | None = Form(None),
+    actId: str | None = Form(None),  # external lost-item reference id
     image: UploadFile = File(...),
 ):
     # 이미지 읽기
@@ -20,15 +21,13 @@ async def ingest_item(
     if len(image_bytes) == 0:
         raise HTTPException(400, "빈 이미지")
 
-    # 캡션은 단순 category 문자열 사용 (텍스트 임베딩 제거)
-    caption = f"{category}"
     image_vec = embeddings.embed_image(image_bytes)
 
     item_id = str(uuid.uuid4())
     meta = LostItemMeta(
         id=item_id,
+        actId=actId,
         category=category,
-        caption=caption,
         found_place=found_place,
         found_time=found_time,
         notes=notes,
