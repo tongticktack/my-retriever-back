@@ -554,6 +554,36 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
             allow_override=correction_signal,
             override_keys=["category", "subcategory", "lost_date", "region"]
         )
+        # Region post-processing: remove relative date words mistakenly captured as region, attempt recovery
+        try:
+            REL_DATE = {"어제","오늘","그저께","그제","이틀전","삼일전","3일전","2일전","최근","방금"}
+            reg_val = extracted.get('region')
+            if reg_val and reg_val in REL_DATE:
+                extracted.pop('region', None)
+            if not extracted.get('region'):
+                # Attempt to recover place from user_text tokens
+                import re as _re
+                tokens = _re.split(r"\s+", user_text.strip())
+                cand = None
+                for t in tokens:
+                    base = t
+                    m = _re.match(r"(.+?)(?:에서|에)$", t)
+                    if m:
+                        base = m.group(1)
+                        # Treat anything that had '에서' suffix as a location candidate directly if length ok
+                        if 2 <= len(base) <= 15 and base not in REL_DATE:
+                            cand = base
+                            break
+                    if len(base) < 2 or len(base) > 15:
+                        continue
+                    # Heuristic: ends with typical location suffix OR in gazetteer list
+                    if base.endswith(("역","구","동","터미널","공항")) or base in {"종로","강남","신촌","홍대","잠실","건대","인천공항"}:
+                        cand = base
+                        break
+                if cand:
+                    extracted['region'] = cand
+        except Exception as _e:
+            print('[extraction.region_sanitize] error', _e)
         # Source tagging + conflict detection
         conflicts = current.get('conflicts') or {}
         vision_conf_map = {}

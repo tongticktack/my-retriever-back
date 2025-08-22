@@ -23,6 +23,7 @@ MULTI_IMAGE_MIN_INTERNAL_SIMILARITY = getattr(settings, 'MULTI_IMAGE_MIN_INTERNA
 # Date filtering configuration
 PRIMARY_DATE_WINDOW_DAYS = getattr(settings, 'PRIMARY_DATE_WINDOW_DAYS', 14)  # 1차 윈도우 (±N일)
 EXPANDED_DATE_WINDOW_DAYS = getattr(settings, 'EXPANDED_DATE_WINDOW_DAYS', 30)  # 확장 윈도우
+STRICT_DATE_MATCH_DAYS = getattr(settings, 'STRICT_DATE_MATCH_DAYS', 3)  # 최종 matches 에 허용되는 ±일 수
 
 def _parse_iso_date(s: str) -> Optional[date]:
     if not s:
@@ -496,6 +497,25 @@ def send_message(req: SendMessageRequest):
                     matches = img_items
     except Exception as e:
         print(f"[chat.send] image->matches merge error: {e}")
+
+    # Strict date filtering for matches (±STRICT_DATE_MATCH_DAYS) if user provided lost_date
+    try:
+        active_idx = lost_state.get("active_index")
+        active_item = None
+        if active_idx is not None:
+            active_item = (lost_state.get("items") or [])[active_idx]
+        extracted = (active_item or {}).get("extracted") or {}
+        user_lost_date = _parse_iso_date(extracted.get("lost_date")) if extracted.get("lost_date") else None
+        if user_lost_date and matches:
+            filtered = []
+            for m in matches:
+                f_raw = m.get('foundDate') or m.get('found_time') or m.get('found_date')
+                f_date = _parse_iso_date(f_raw) if isinstance(f_raw, str) else None
+                if f_date and _within_window(f_date, user_lost_date, STRICT_DATE_MATCH_DAYS):
+                    filtered.append(m)
+            matches = filtered if filtered else []
+    except Exception as e:
+        print(f"[chat.send] strict date filter error: {e}")
 
     return SendMessageResponse(
         session_id=req.session_id,
