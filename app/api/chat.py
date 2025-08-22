@@ -186,9 +186,12 @@ def send_message(req: SendMessageRequest):
         chosen_model = "multi-image-validation"
         active_item_snapshot = None
     else:
+        from time import time as _t
+        _t0 = _t()
         assistant_reply, lost_state, chosen_model, active_item_snapshot = extc.process_message(
             req.content, lost_state, start_new_trigger, image_urls=image_urls
         )
+        print(f"[chat.send] extraction_controller latency={( _t() - _t0):.2f}s model={chosen_model} reply_len={len(assistant_reply) if assistant_reply else 0}")
     # After extraction: run metadata-based candidate filtering + image similarity (lazy) if user supplied images
     if (assistant_reply is not None) and user_meta and user_meta.get("attachments") and not multi_image_conflict:
         try:
@@ -317,10 +320,12 @@ def send_message(req: SendMessageRequest):
         llm = get_llm()
         provider_messages = build_messages(req.session_id, req.content, retrieval_items=None, law_summary=None)
         try:
+            print(f"[chat.send] general_llm_call provider={getattr(llm,'name',None)} model={getattr(llm,'model',None)}")
             assistant_reply = llm.generate(provider_messages)
         except Exception as e:
             assistant_reply = f"(llm-error) {str(e)[:120]}"
         chosen_model = getattr(llm, "last_model_name", None) or getattr(llm, "model", None) or getattr(llm, "name", "unknown")
+        print(f"[chat.send] general_llm_done model={chosen_model} len={len(assistant_reply)}")
 
     assistant_meta = {"model": chosen_model}
     assistant_msg_id = chat_store.add_message(
@@ -445,7 +450,7 @@ def send_message(req: SendMessageRequest):
                 trimmed = []
                 for iid, score, meta, *_rest in ranked_source[:10]:
                     trimmed.append({
-                        'atcId': meta.get('actId') or meta.get('id') or iid,
+                        'atcId': meta.get('atcId') or meta.get('id') or iid,
                         'collection': 'internal-text',
                         'itemCategory': meta.get('category'),
                         'itemName': meta.get('caption') or meta.get('notes') or meta.get('category'),
@@ -470,9 +475,9 @@ def send_message(req: SendMessageRequest):
             for iid, score, meta in image_search_results:
                 if not isinstance(meta, dict):
                     continue
-                act_id = meta.get('actId') or meta.get('act_id') or meta.get('id') or iid
+                atc_id = meta.get('atcId') or meta.get('atc_id') or meta.get('id') or iid
                 img_items.append({
-                    'atcId': act_id,
+                    'atcId': atc_id,
                     'collection': 'internal-image',
                     'itemCategory': meta.get('category'),
                     'itemName': meta.get('caption') or meta.get('notes') or meta.get('category'),

@@ -67,7 +67,6 @@ class OpenAIProvider(BaseLLMProvider):
         self.model = settings.OPENAI_MODEL_NAME
 
     def generate(self, messages: List[ChatMessage], **kwargs) -> str:
-        # Map to OpenAI format (supports content as str OR multimodal list already prepared upstream)
         formatted: List[Dict[str, Any]] = []
         for m in messages:
             role = m.get("role")
@@ -79,11 +78,20 @@ class OpenAIProvider(BaseLLMProvider):
                 formatted.append({"role": role, "content": content})
             else:
                 formatted.append({"role": role, "content": str(content)})
+        import time
+        start = time.time()
         try:
+            print(f"[llm:openai] start model={self.model} msg_count={len(formatted)}")
+            # Some versions of openai lib (>=1.x) use different client style; keep legacy call.
             resp = openai.chat.completions.create(model=self.model, messages=formatted, timeout=15)  # type: ignore
+            dur = time.time() - start
             self._last_status = "ok"
-            return resp.choices[0].message.content  # type: ignore
+            out = resp.choices[0].message.content  # type: ignore
+            print(f"[llm:openai] done model={self.model} latency={dur:.2f}s chars={len(out) if out else 0}")
+            return out
         except Exception as e:  # pragma: no cover
+            dur = time.time() - start
+            print(f"[llm:openai] error model={self.model} latency={dur:.2f}s type={type(e).__name__} msg={str(e)[:180]}")
             self._last_status = "fallback"
             return f"{str(e)[:400]}"
 

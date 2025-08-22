@@ -44,7 +44,11 @@ subcategory 를 포함하려면 반드시 위 map 내 정확 일치 문자열 �
 3. category 는 위 20개 중 확실 1개. 애매→생략.
 4. subcategory 는 해당 category 하위에서 확실할 때만. (규칙) subcategory 출력 시 map 기준 정확 일치 + 대응 category 동시 출력. 텍스트/이미지 소분류 단서만 있어도 map 통해 category 추론. 애매/사진만으로 불명확→둘 다 생략.
 6. lost_date: 텍스트가 단일 상대/절대 날짜 제공 시만 YYYY-MM-DD. 이미지 단독 추정 금지.
-7. region: 텍스트에 명시된 지명(<=12자). 내부 고정 목록 기대/의존 금지 (새 지명 그대로). 단일 일반어("역", "근처", "주변" 등)만 있으면 생략. 이미지 배경 추정 금지.
+	- 절대 날짜 입력 포맷 허용: YYYY-MM-DD, YYYY.MM.DD, YYYY/MM/DD, YYYYMMDD, YYYY년M월D일 (공백 허용). 모두 YYYY-MM-DD 로 정상화.
+	- 월/일 한 자리면 zero-pad. 복수 후보/모호(두 날짜, "6월 5일이나 6일", "어제 또는 3일 전") → lost_date 생략.
+	- 잘못된/불가능 날짜(월>12, 일>31, 2월 30일 등), 미래, 2018-01-01 이전 → 생략.
+	- 상대표현 2개 이상 충돌 또는 절대/상대 서로 3일 이상 차이 → 생략.
+7. region: 텍스트 명시 실제 지명/행정구역/장소명(<=12자). 인사말(안녕 등), 시간 표현(어제/오늘/그저께/3일 전 등), 추상 일반어("역", "근처", "주변" 단독) 금지. 문장 내 복수 후보가 있을 때는 (i) '에서/에' 접미사 포함 토큰에서 접미사 제거한 핵심 지명, (ii) 장소 접미사(역/구/동/터미널/공항/대/대학교/캠퍼스) 포함, (iii) 길이 2~8 범위, 를 점수화하여 가장 구체적 1개 선택. 적합 후보 없으면 region 생략. 이미지 배경 추정 금지.
 8. brand/material/pattern 은 확신(confidences 값) 0.55 미만이면 필드 자체 생략 및 confidences에도 제외.
 9. confidences: 존재 필드(category, subcategory, brand, material, pattern)만 0~1 두 자리 float.
 10. 추측/창작 금지 (텍스트/이미지에 없는 모델명, 장소, 날짜, 브랜드 이름 생성 X).
@@ -95,6 +99,21 @@ category, subcategory, lost_date, region, brand, material, pattern, notable_feat
 
 예12: (현재: {"category":"지갑","subcategory":"기타 지갑","region":"강남"}) 텍스트 "강남 아니고 신촌역입니다"
 {"category":"지갑","subcategory":"기타 지갑","region":"신촌역"}
+
+예13: 텍스트 "20250625 강남역에서 지갑" + 이미지 없음
+{"category":"지갑","subcategory":"기타 지갑","lost_date":"2025-06-25","region":"강남역"}
+
+예14: 텍스트 "2025년06월25일 신촌에서 카드" + 이미지 없음
+{"category":"카드","subcategory":"기타카드","lost_date":"2025-06-25","region":"신촌"}
+
+예15: 텍스트 "2025.9.6 잠실에서 아이폰" + 이미지 아이폰
+{"category":"휴대폰","subcategory":"아이폰","lost_date":"2025-09-06","region":"잠실","confidences":{"category":0.95,"subcategory":0.90}}
+
+예16: 텍스트 "9월6일이나 7일 사이 강남역에서 지갑" + 이미지 없음 (모호)
+{"category":"지갑","subcategory":"기타 지갑","region":"강남역"}
+
+예17: 텍스트 "어제나 3일 전 신촌에서 가방" + 이미지 없음 (모호 두 상대표현)
+{"category":"가방","subcategory":"기타가방","region":"신촌"}
 
 [FAILSAFE]
 파싱 실패/비한국어 → {}

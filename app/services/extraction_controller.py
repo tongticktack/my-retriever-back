@@ -187,6 +187,11 @@ def _load_multimodal_prompt() -> str:
 def _strict_llm_extract(user_text: str, current: Dict[str, str], image_urls: Optional[List[str]] = None) -> Dict[str, Any]:  # pragma: no cover (LLM)
     """LLM JSON-only structured extraction using external prompt file with retry & light repair."""
     llm = get_llm()
+    # debug: record provider + model for diagnostics
+    try:
+        print(f"[extract.llm] provider={getattr(llm,'name',None)} model={getattr(llm,'model',None)} text_len={len(user_text)} images={len(image_urls) if image_urls else 0}")
+    except Exception:
+        pass
     today = datetime.now().date().isoformat()
     # dynamic few-shot date replacements
     try:
@@ -326,19 +331,62 @@ def _strict_llm_extract(user_text: str, current: Dict[str, str], image_urls: Opt
                     kept_conf.pop(opt_key, None)
         if kept_conf:
             cleaned['confidences'] = kept_conf
+        # Normalize lost_date if present in alternative formats (YYYYMMDD, YYYY.MM.DD, YYYY/MM/DD, YYYY년MM월DD일)
+        ld = cleaned.get('lost_date')
+        if ld:
+            orig = ld
+            norm = None
+            try:
+                import re as _re
+                from datetime import datetime as _dt
+                p1 = _re.match(r'^(20\d{2})(\d{2})(\d{2})$', ld)
+                p2 = _re.match(r'^(20\d{2})[./](\d{1,2})[./](\d{1,2})$', ld)
+                p3 = _re.match(r'^(20\d{2})년\s*(\d{1,2})월\s*(\d{1,2})일$', ld)
+                if p1:
+                    y, m, d = p1.groups()
+                elif p2:
+                    y, m, d = p2.groups()
+                elif p3:
+                    y, m, d = p3.groups()
+                else:
+                    # already maybe YYYY-MM-DD
+                    if _re.match(r'^20\d{2}-\d{2}-\d{2}$', ld):
+                        y, m, d = ld.split('-')
+                    else:
+                        y = m = d = None
+                if y and m and d:
+                    dt_obj = _dt(int(y), int(m), int(d))
+                    norm = dt_obj.strftime('%Y-%m-%d')
+            except Exception:
+                norm = None
+            if norm:
+                cleaned['lost_date'] = norm
+            else:
+                # Drop if cannot normalize to canonical form
+                if not re.match(r'^20\d{2}-\d{2}-\d{2}$', ld):
+                    cleaned.pop('lost_date', None)
+                    if 'confidences' in cleaned and 'lost_date' in cleaned['confidences']:
+                        cleaned['confidences'].pop('lost_date', None)
+            if orig != cleaned.get('lost_date'):
+                print(f"[extract.llm] normalize_date raw={orig} -> {cleaned.get('lost_date')}")
         return cleaned
 
     raw = ""
     for attempt in range(2):  # one retry if first malformed
         try:
             raw = llm.generate(messages).strip()
+            if not raw:
+                print(f"[extract.llm] empty_output attempt={attempt}")
         except Exception:
+            print(f"[extract.llm] exception attempt={attempt}")
             return {}
         parsed = _attempt_parse(raw)
         if parsed is not None:
             return _clean(parsed)
         # repair hint for retry: force user to output ONLY JSON
         messages.append({"role": "user", "content": "JSON 형식 오류. 순수 JSON 객체만 다시 출력."})
+    # final debug
+    print(f"[extract.llm] parse_failed snippet={raw[:120]!r}")
     return {}
 
 
@@ -481,7 +529,8 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
         # Run approximate external search now (after explicit user confirm)
         search_msg = "공개 습득물 근사 검색을 시작합니다."
         try:
-            matches = external_search.approximate_external_matches(current.get("extracted") or {}, max_results=5)
+            extracted_payload = current.get("extracted") or {}
+            matches = external_search.approximate_external_matches(extracted_payload, place_query=extracted_payload.get('region'), max_results=5)
             if matches:
                 current['external_matches'] = matches
                 summary_line = external_search.summarize_matches(matches, limit=3)

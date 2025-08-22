@@ -47,12 +47,39 @@ async def log_requests(request: Request, call_next):
     start = time()
     path = request.url.path
     method = request.method
+    query = request.url.query
+    client_ip = getattr(request.client, 'host', '-') if request.client else '-'
+    ua = request.headers.get('user-agent','')[:120]
+    # Read small bodies for debug (avoid large file uploads)
+    body_preview = ""
+    try:
+        if request.method in {"POST","PUT","PATCH"}:
+            body_bytes = await request.body()
+            if body_bytes:
+                body_preview = body_bytes[:300].decode('utf-8','ignore')
+                if len(body_bytes) > 300:
+                    body_preview += "..."
+    except Exception:
+        body_preview = "<unreadable>"
+    if method == 'GET' and query:
+        print(f"[req:start] {method} {path}?{query} ip={client_ip} ua={ua!r}")
+    else:
+        print(f"[req:start] {method} {path} ip={client_ip} ua={ua!r} body={body_preview!r}")
     try:
         response = await call_next(request)
         return response
     finally:
         duration = (time() - start) * 1000
-        print(f"[req] {method} {path} {duration:.1f}ms")
+        status = getattr(locals().get('response', None), 'status_code', 'NA')
+        size = '-'  # attempt to read content-length header
+        try:
+            size = response.headers.get('content-length') if 'response' in locals() else '-'
+        except Exception:
+            pass
+        if method == 'GET' and query:
+            print(f"[req:end] {method} {path}?{query} status={status} {duration:.1f}ms size={size}")
+        else:
+            print(f"[req:end] {method} {path} status={status} {duration:.1f}ms size={size}")
 
 try:
     from fastapi.middleware.cors import CORSMiddleware

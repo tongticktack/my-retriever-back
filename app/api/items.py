@@ -13,7 +13,7 @@ async def ingest_item(
     found_place: str | None = Form(None),
     found_time: str | None = Form(None),
     notes: str | None = Form(None),
-    actId: str | None = Form(None),  # external lost-item reference id
+    atcId: str | None = Form(None),  # external lost-item reference id
     image: UploadFile = File(...),
 ):
     # 이미지 읽기
@@ -26,7 +26,7 @@ async def ingest_item(
     item_id = str(uuid.uuid4())
     meta = LostItemMeta(
         id=item_id,
-        actId=actId,
+        atcId=atcId,
         category=category,
         found_place=found_place,
         found_time=found_time,

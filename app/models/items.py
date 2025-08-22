@@ -10,7 +10,7 @@ class LostItemIngest(BaseModel):
 
 class LostItemMeta(BaseModel):
     id: str
-    actId: str | None = None  # external public lost-item page id (optional)
+    atcId: str | None = None  # external public lost-item page id (optional)
     category: str
     found_place: Optional[str] = None
     found_time: Optional[str] = None

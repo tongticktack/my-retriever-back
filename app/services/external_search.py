@@ -1,39 +1,37 @@
 """Approximate external lost-item search (PoliceLostItem / PortalLostItem) without embeddings.
 
 Goal:
-    Use structured extracted fields (category, subcategory, lost_date, region) to retrieve
+    Use structured extracted fields (category, subcategory, lost_date, place_query) to retrieve
   likely matches from two Firestore collections that share the same schema:
     - PoliceLostItem
     - PortalLostItem
 
 Assumptions (per user description):
-  Document ID == atcId field value.
-  Fields: atcId, createdAt, foundDate (YYYY-MM-DD), imageUrl, itemCategory ("대분류 > 중분류"),
-          itemName (comma separated items possible), location (string or coord), storagePlace.
+    Document ID == atcId field value.
+    Fields: atcId, foundDate (YYYY-MM-DD), imageUrl, itemCategory ("대분류 > 중분류"),
+                    itemName (comma separated items possible), location (string or coord), addr (was storagePlace).
 
 Firestore constraints:
-  - Limited composite querying; we keep queries simple (category + foundDate equality) and
-    issue multiple small queries for a date window. Post-filter & score client side.
+    - Keep Firestore query simple: category prefix + exact foundDate equality only.
+    - All partial (substring) matching for 장소는 Python 메모리에서 storagePlace 대상으로만 수행.
 
-Scoring heuristic (max ~100):
-  +40 category exact match
-  +15 subcategory exact match
-  +15 color token match inside itemName (or itemCategory tail)
-  +15 date closeness (15 - 5*abs(day_delta); floor at 0)
-  +10 region substring in storagePlace or itemName
-  +5  bonus if multiple (>=2) color synonyms matched (rare)
+Scoring heuristic (max ~80):
+    +40 category exact match
+    +10 subcategory exact match (소분류 신뢰도 낮음 → 낮은 가중치 유지)
+    +15 date closeness (within ±3 days: 15 - 5*|Δdays|, floor 0)
+    +10 storagePlace 부분 문자열 매치 (place_query 포함)
 
 Returned structure per match:
   {
-     'atcId': str,
-     'collection': 'PoliceLostItem'|'PortalLostItem',
-     'itemCategory': str,
-     'itemName': str,
-     'foundDate': str,
-     'storagePlace': str|None,
-     'imageUrl': str|None,
-     'score': float,
-     'components': {<component>: value}
+      'atcId': str,
+      'collection': 'PoliceLostItem'|'PortalLostItem',
+      'itemCategory': str,
+      'itemName': str,
+      'foundDate': str,
+      'addr': str|None,            # unified; populated from Firestore 'addr' or legacy 'storagePlace'
+      'imageUrl': str|None,
+      'score': float,
+    'components': {<component>: value}
   }
 
 Usage:
@@ -42,7 +40,7 @@ Usage:
 """
 from __future__ import annotations
 from typing import Dict, List, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime
 import re
 
 from app.domain import lost_item_schema as schema
@@ -52,10 +50,8 @@ COLLECTIONS = ["PoliceLostItem", "PortalLostItem"]
 
 ## 색상 관련 요소 제거 (COLOR_SET 등)
 
-# Window in days around lost_date to probe (inclusive)
-DATE_WINDOW = 2  # ±2 days
-MAX_DOCS_PER_DAY_PER_COLLECTION = 15  # cap to limit cost
-FALLBACK_RECENT_LIMIT = 20
+DATE_WINDOW = 3  # ±3 days retrieval window
+MAX_DOCS_PER_DAY_PER_COLLECTION = 60  # per day cap per collection within window
 
 _DATE_RE = re.compile(r"^20\d{2}-\d{2}-\d{2}$")
 
@@ -75,24 +71,21 @@ def _split_item_category(cat_field: str | None) -> Tuple[str | None, str | None]
 def _tokenize(text: str) -> List[str]:
     return [t for t in re.split(r"[\s,;:/]+", text.lower()) if t]
 
-def _score(doc: Dict, extracted: Dict) -> Tuple[float, Dict[str, float]]:
+def _score(doc: Dict, extracted: Dict, place_query: str | None) -> Tuple[float, Dict[str, float]]:
     comp: Dict[str, float] = {}
     score = 0.0
     want_cat = extracted.get('category')
     want_sub = extracted.get('subcategory')
     # 색상 사용 안 함
-    want_region = extracted.get('region')
     want_date = extracted.get('lost_date')
 
     doc_cat, doc_sub = _split_item_category(doc.get('itemCategory'))
     if want_cat and doc_cat == want_cat:
         comp['category'] = 40; score += 40
     if want_sub and doc_sub == want_sub:
-        comp['subcategory'] = 15; score += 15
+        comp['subcategory'] = 10; score += 10  # lowered weight due to possible subcategory extraction errors
 
-    # 색상 스코어링 제거
-
-    # date closeness
+    # date closeness within ±3 days
     fd = doc.get('foundDate')
     if want_date and fd and _DATE_RE.match(fd):
         try:
@@ -106,20 +99,16 @@ def _score(doc: Dict, extracted: Dict) -> Tuple[float, Dict[str, float]]:
         except Exception:
             pass
 
-    # region substring in storagePlace or itemName
-    if want_region:
-        for field in ['storagePlace', 'itemName']:
-            val = doc.get(field)
-            if isinstance(val, str) and want_region in val:
-                comp['region'] = 10; score += 10
-                break
+    # storagePlace substring (place_query)
+    if place_query:
+        sp = doc.get('storagePlace') or doc.get('addr') or ''
+        if isinstance(sp, str) and place_query in sp.lower():
+            comp['place'] = 10; score += 10
 
     return score, comp
 
 def _query_candidates(collection: str, extracted: Dict) -> List[Dict]:
-    """Issue a handful of cheap Firestore queries and aggregate snapshots.
-    We purposely keep queries narrow (category + foundDate equality) to leverage indexes.
-    """
+    """Fetch candidates by (category prefix + foundDate within ±DATE_WINDOW days)."""
     try:
         db = chat_store.get_db()
     except Exception:
@@ -135,10 +124,10 @@ def _query_candidates(collection: str, extracted: Dict) -> List[Dict]:
             base_date = None
         if base_date:
             for offset in range(-DATE_WINDOW, DATE_WINDOW + 1):
-                day = (base_date + timedelta(days=offset)).isoformat()
+                day = (base_date).fromordinal(base_date.toordinal() + offset).isoformat()
                 try:
                     q = col.where('itemCategory', '>=', f"{want_cat}") \
-                           .where('itemCategory', '<', f"{want_cat}~")  # prefix hack (~ beyond unicode)
+                            .where('itemCategory', '<', f"{want_cat}~")
                     q = q.where('foundDate', '==', day).limit(MAX_DOCS_PER_DAY_PER_COLLECTION)
                     for snap in q.stream():
                         if snap.id not in docs:
@@ -146,31 +135,57 @@ def _query_candidates(collection: str, extracted: Dict) -> List[Dict]:
                             d['atcId'] = snap.id
                             d['collection'] = collection
                             docs[snap.id] = d
-                except Exception:
-                    continue
-    # Fallback: recent items if not enough docs
-    if len(docs) < 5:
-        try:
-            q2 = col.order_by('createdAt', direction=chat_store.firestore.Query.DESCENDING).limit(FALLBACK_RECENT_LIMIT)  # type: ignore
-            for snap in q2.stream():
-                if snap.id not in docs:
-                    d = snap.to_dict() or {}
-                    d['atcId'] = snap.id
-                    d['collection'] = collection
-                    docs[snap.id] = d
-        except Exception:
-            pass
+                except Exception as e:
+                    print(f"[external_search] date_window_query_error {collection} day={day}: {e}")
     return list(docs.values())
 
-def approximate_external_matches(extracted: Dict, max_results: int = 10) -> List[Dict]:
-    if not extracted or not extracted.get('category'):
+def approximate_external_matches(extracted: Dict, place_query: str | None = None, max_results: int = 10) -> List[Dict]:
+    if not extracted or not extracted.get('category') or not extracted.get('lost_date'):
         return []
+    # If caller omitted place_query explicitly, fall back to extracted region field
+    if place_query is None:
+        place_query = extracted.get('region')
+    # normalize place_query (search target is storagePlace only)
+    if place_query:
+        pq_norm = str(place_query).strip().lower()
+        place_query = pq_norm if len(pq_norm) >= 2 else None
+    try:
+        print(
+            "[external_search] start category=%s sub=%s date=%s place_query=%s max=%s" % (
+                extracted.get('category'),
+                extracted.get('subcategory'),
+                extracted.get('lost_date'),
+                place_query,
+                max_results,
+            )
+        )
+    except Exception:
+        pass
     all_docs: List[Dict] = []
     for coll in COLLECTIONS:
-        all_docs.extend(_query_candidates(coll, extracted))
+        before = len(all_docs)
+        try:
+            cand = _query_candidates(coll, extracted)
+        except Exception as e:
+            print(f"[external_search] collection_error {coll}: {e}")
+            cand = []
+        all_docs.extend(cand)
+        added = len(all_docs) - before
+        print(f"[external_search] collected collection={coll} added={added} total={len(all_docs)}")
+    # place_query filtering (hard filter first, fallback if empty)
+    filtered = all_docs
+    place_filtered = False
+    fallback_place = False
+    if place_query:
+        tmp = [d for d in all_docs if isinstance(d.get('storagePlace'), str) and place_query in d.get('storagePlace').lower()]
+        if tmp:
+            filtered = tmp
+            place_filtered = True
+        else:
+            fallback_place = True  # keep original set
     scored: List[Tuple[float, Dict]] = []
-    for d in all_docs:
-        s, comp = _score(d, extracted)
+    for d in filtered:
+        s, comp = _score(d, extracted, place_query)
         if s <= 0:
             continue
         d_copy = {k: v for k, v in d.items()}
@@ -178,6 +193,26 @@ def approximate_external_matches(extracted: Dict, max_results: int = 10) -> List
         d_copy['components'] = comp
         scored.append((s, d_copy))
     scored.sort(key=lambda x: x[0], reverse=True)
+    if not scored:
+        print(f"[external_search] no_scored_matches category={extracted.get('category')} sub={extracted.get('subcategory')} date={extracted.get('lost_date')} place_query={place_query}")
+    else:
+        top_ids = [d['atcId'] for _, d in scored[:max_results]]
+        print(f"[external_search] scored_matches count={len(scored)} top={top_ids} place_filtered={place_filtered} fallback_place={fallback_place}")
+        # Detail component breakdown for top few
+        for _, dd in scored[: min(5, len(scored))]:
+            try:
+                print(
+                    "[external_search] detail atcId=%s score=%.2f comp=%s cat=%s foundDate=%s place_hit=%s" % (
+                        dd.get('atcId'),
+                        dd.get('score'),
+                        dd.get('components'),
+                        dd.get('itemCategory'),
+                        dd.get('foundDate'),
+                        'place' in (dd.get('components') or {}),
+                    )
+                )
+            except Exception:
+                pass
     return [d for _, d in scored[:max_results]]
 
 def summarize_matches(matches: List[Dict], limit: int = 3) -> str:
@@ -188,6 +223,6 @@ def summarize_matches(matches: List[Dict], limit: int = 3) -> str:
         cat = m.get('itemCategory') or ''
         nm = m.get('itemName') or ''
         fd = m.get('foundDate') or ''
-        place = m.get('storagePlace') or ''
+        place = m.get('storagePlace') or m.get('addr') or ''
         lines.append(f"- {cat} | {nm[:30]} | {fd} | {place[:20]} | 점수 {m.get('score')}")
     return "유사 공개 습득물 후보:\n" + "\n".join(lines)
