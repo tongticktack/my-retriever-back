@@ -231,7 +231,7 @@ def send_message(req: SendMessageRequest):
             print(f"[chat.image_search.meta] error: {e}")
     # After extraction reconcile image-derived color vs extracted color if mismatch
     # 색상 reconcile 제거
-    # If controller produced reply and we have similarity results, augment
+    # If controller produced reply and we have similarity results, append textual list
     if assistant_reply and image_search_results:
         if image_search_results:
             lines = []
@@ -315,7 +315,7 @@ def send_message(req: SendMessageRequest):
     user_attachments = None
     if user_meta and user_meta.get("attachments"):
         user_attachments = user_meta.get("attachments")
-    # Build matches list (external first, then internal text-fallback)
+    # Build matches list (external, then internal text-fallback)
     matches = None
     try:
         active_idx = lost_state.get("active_index")
@@ -383,7 +383,9 @@ def send_message(req: SendMessageRequest):
     except Exception as e:
         print(f"[chat.send] matches build error: {e}")
 
-    # Append markdown links for public lost item pages (lost112)
+    # Do NOT merge image similarity into matches (rollback behavior)
+
+    # Append markdown links for public lost item pages (lost112 proxy)
     try:
         link_ids: List[str] = []
         # Prefer image similarity result ids (actId) if available
@@ -400,7 +402,8 @@ def send_message(req: SendMessageRequest):
                 if act_id and act_id not in link_ids:
                     link_ids.append(str(act_id))
         if link_ids:
-            lines = [f"- [ACT_ID {aid}](https://lost112.go.kr/find/findDetail.do?ACT_ID={aid}&FD_SN=1)" for aid in link_ids]
+            # Use internal proxy GET endpoint so browser can just follow link; server will POST upstream.
+            lines = [f"- [ACT_ID {aid}](/proxy/lost112/{aid})" for aid in link_ids]
             assistant_reply += "\n\n관련 분실물 링크:\n" + "\n".join(lines)
     except Exception as e:
         print(f"[chat.send] link build error: {e}")
@@ -410,7 +413,7 @@ def send_message(req: SendMessageRequest):
         user_message=Message(id=user_msg_id, role="user", content=req.content, created_at=created_at, model=None, attachments=user_attachments),
         assistant_message=Message(id=assistant_msg_id, role="assistant", content=assistant_reply, created_at=assistant_created_at, model=chosen_model, attachments=None),
         active_lost_item=active_item_snapshot,
-        matches=matches,
+    matches=matches,
     )
 
 @router.get("/history/{session_id}", response_model=HistoryResponse)
