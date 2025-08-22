@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
+from datetime import datetime, date
 
 from app.services import chat_store
 from app.services.llm_providers import get_llm
@@ -19,6 +20,23 @@ IMAGE_SIMILARITY_THRESHOLD = 0.70  # minimum cosine similarity (dot since embedd
 MAX_MEDIA_PER_MESSAGE = 3  # allow up to 3 images per user message
 # Multi-image 내 최소 쌍 유사도 임계 (환경 변수로 조정 가능)
 MULTI_IMAGE_MIN_INTERNAL_SIMILARITY = getattr(settings, 'MULTI_IMAGE_MIN_INTERNAL_SIMILARITY', 0.45)
+# Date filtering configuration
+PRIMARY_DATE_WINDOW_DAYS = getattr(settings, 'PRIMARY_DATE_WINDOW_DAYS', 14)  # 1차 윈도우 (±N일)
+EXPANDED_DATE_WINDOW_DAYS = getattr(settings, 'EXPANDED_DATE_WINDOW_DAYS', 30)  # 확장 윈도우
+
+def _parse_iso_date(s: str) -> Optional[date]:
+    if not s:
+        return None
+    s = s.strip().split(' ')[0]  # if accidental datetime string
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+def _within_window(found: Optional[date], target: Optional[date], window_days: int) -> bool:
+    if not found or not target:
+        return False
+    return abs((found - target).days) <= window_days
 
 class CreateSessionRequest(BaseModel):
     user_id: str
@@ -184,7 +202,11 @@ def send_message(req: SendMessageRequest):
                     extracted = {}
             cat = (extracted.get("category") or "").strip().lower() if extracted else ""
             region = (extracted.get("region") or "").strip().lower() if extracted else ""
+            lost_date = _parse_iso_date(extracted.get("lost_date") if extracted else None)
             candidates = []
+            # 1차: category/region + 날짜 윈도우(있으면)
+            primary_window_ids = []
+            expanded_needed = False
             for iid, meta in _fi.META.items():
                 # Skip ephemeral session-added entries (we tagged with type)
                 if isinstance(meta, dict) and meta.get("type") in {"media","lost_item"}:
@@ -198,7 +220,24 @@ def send_message(req: SendMessageRequest):
                     place = str(meta.get("found_place","")) .lower()
                     if region not in place:
                         continue
-                candidates.append(iid)
+                # Date filtering
+                found_raw = meta.get('found_time') or meta.get('foundDate') or meta.get('found_date')
+                found_d = _parse_iso_date(found_raw) if isinstance(found_raw, str) else None
+                if lost_date and found_d:
+                    if _within_window(found_d, lost_date, PRIMARY_DATE_WINDOW_DAYS):
+                        primary_window_ids.append(iid)
+                    elif _within_window(found_d, lost_date, EXPANDED_DATE_WINDOW_DAYS):
+                        expanded_needed = True
+                        candidates.append(iid)  # store for possible expansion
+                else:
+                    # If no date info, keep as fallback candidate list
+                    candidates.append(iid)
+            if lost_date:
+                if primary_window_ids:
+                    candidates = primary_window_ids
+                elif expanded_needed:
+                    # filter candidates to only those within expanded window already collected
+                    pass  # candidates already holds expanded set
             # If no candidates found, fall back to whole index (will be filtered by threshold later)
             candidate_set = set(candidates) if candidates else None
             cache = lost_state.get("_img_cache") or {}
@@ -336,56 +375,127 @@ def send_message(req: SendMessageRequest):
                         'score': m.get('score'),
                     })
                 matches = trimmed
-            if matches is None and not (user_meta and user_meta.get("attachments")):
-                extracted = active_item.get("extracted") if active_item else None
-                if extracted and (extracted.get("category") or extracted.get("region")):
-                    from app.services import faiss_index as _fi
-                    cat_q = (extracted.get("category") or "").lower().strip()
-                    region_q = (extracted.get("region") or "").lower().strip()
-                    candidates = []
-                    for iid, meta in _fi.META.items():
-                        if not isinstance(meta, dict):
-                            continue
-                        if meta.get("type") in {"media","lost_item"}:
-                            continue
-                        mcat = str(meta.get("category") or "").lower()
-                        if cat_q and cat_q not in mcat:
-                            continue
-                        mplace = str(meta.get("found_place") or "").lower()
-                        region_ok = True
-                        if region_q:
-                            region_ok = (region_q in mplace)
-                        if not region_ok:
-                            continue
-                        score = 0.0
-                        if cat_q:
-                            score += 0.7
-                        if region_q and region_ok:
-                            score += 0.3
-                        candidates.append((iid, score, meta))
-                    def _ts(meta):
-                        return meta.get('created_at') or meta.get('createdAt') or ''
-                    candidates.sort(key=lambda x: (x[1], _ts(x[2])), reverse=True)
-                    trimmed = []
-                    for iid, score, meta in candidates[:10]:
-                        trimmed.append({
-                            'atcId': meta.get('actId') or meta.get('id') or iid,
-                            'collection': 'internal-text',
-                            'itemCategory': meta.get('category'),
-                            'itemName': meta.get('caption') or meta.get('notes') or meta.get('category'),
-                            'foundDate': meta.get('found_time'),
-                            'storagePlace': meta.get('found_place'),
-                            'imageUrl': None,
-                            'score': round(score, 3),
-                        })
-                    if trimmed:
-                        matches = trimmed
+        if matches is None and not (user_meta and user_meta.get("attachments")):
+            extracted = active_item.get("extracted") if active_item else None
+            if extracted and (extracted.get("category") or extracted.get("region")):
+                from app.services import faiss_index as _fi
+                cat_q = (extracted.get("category") or "").lower().strip()
+                region_q = (extracted.get("region") or "").lower().strip()
+                lost_date = _parse_iso_date(extracted.get("lost_date")) if extracted.get("lost_date") else None
+                candidates = []
+                primary = []
+                expanded = []
+                for iid, meta in _fi.META.items():
+                    if not isinstance(meta, dict):
+                        continue
+                    if meta.get("type") in {"media","lost_item"}:
+                        continue
+                    mcat = str(meta.get("category") or "").lower()
+                    if cat_q and cat_q not in mcat:
+                        continue
+                    mplace = str(meta.get("found_place") or "").lower()
+                    region_ok = True
+                    if region_q:
+                        region_ok = (region_q in mplace)
+                    if not region_ok:
+                        continue
+                    # Date handling
+                    found_raw = meta.get('found_time') or meta.get('foundDate') or meta.get('found_date')
+                    found_d = _parse_iso_date(found_raw) if isinstance(found_raw, str) else None
+                    in_primary = False
+                    in_expanded = False
+                    if lost_date and found_d:
+                        if _within_window(found_d, lost_date, PRIMARY_DATE_WINDOW_DAYS):
+                            in_primary = True
+                        elif _within_window(found_d, lost_date, EXPANDED_DATE_WINDOW_DAYS):
+                            in_expanded = True
+                    score = 0.0
+                    if cat_q:
+                        score += 0.55
+                    if region_q and region_ok:
+                        score += 0.25
+                    # Date score (only when both dates present)
+                    if lost_date and found_d:
+                        delta_days = abs((found_d - lost_date).days)
+                        max_window = PRIMARY_DATE_WINDOW_DAYS if delta_days <= PRIMARY_DATE_WINDOW_DAYS else EXPANDED_DATE_WINDOW_DAYS
+                        date_score = max(0.0, 1 - delta_days / max_window)
+                        score += date_score * 0.20
+                    elif lost_date and not found_d:
+                        score += 0.08  # partial credit for unknown date
+                    entry = (iid, score, meta, in_primary, in_expanded)
+                    candidates.append(entry)
+                    if in_primary:
+                        primary.append(entry)
+                    elif in_expanded:
+                        expanded.append(entry)
+                def _ts(meta):
+                    return meta.get('created_at') or meta.get('createdAt') or ''
+                ranked_source = []
+                if lost_date:
+                    if primary:
+                        ranked_source.extend(primary)
+                    elif expanded:
+                        ranked_source.extend(expanded)
+                    else:
+                        ranked_source.extend(candidates)
+                else:
+                    ranked_source = candidates
+                ranked_source.sort(key=lambda x: (x[1], _ts(x[2])), reverse=True)
+                trimmed = []
+                for iid, score, meta, *_rest in ranked_source[:10]:
+                    trimmed.append({
+                        'atcId': meta.get('actId') or meta.get('id') or iid,
+                        'collection': 'internal-text',
+                        'itemCategory': meta.get('category'),
+                        'itemName': meta.get('caption') or meta.get('notes') or meta.get('category'),
+                        'foundDate': meta.get('found_time'),
+                        'storagePlace': meta.get('found_place'),
+                        'imageUrl': None,
+                        'score': round(score, 3),
+                    })
+                if trimmed:
+                    matches = trimmed
     except Exception as e:
         print(f"[chat.send] matches build error: {e}")
 
     # Do NOT merge image similarity into matches (rollback behavior)
 
     # Removed: proxy link markdown injection (요청에 따라 링크 제공 X)
+
+    # Merge image similarity candidates into matches with source tag
+    try:
+        if image_search_results:
+            img_items = []
+            for iid, score, meta in image_search_results:
+                if not isinstance(meta, dict):
+                    continue
+                act_id = meta.get('actId') or meta.get('act_id') or meta.get('id') or iid
+                img_items.append({
+                    'atcId': act_id,
+                    'collection': 'internal-image',
+                    'itemCategory': meta.get('category'),
+                    'itemName': meta.get('caption') or meta.get('notes') or meta.get('category'),
+                    'foundDate': meta.get('found_time') or meta.get('foundDate') or meta.get('found_date'),
+                    'storagePlace': meta.get('found_place'),
+                    'imageUrl': meta.get('url') or meta.get('imageUrl') or meta.get('image_url'),
+                    'score': round(float(score), 4),
+                    'source': 'image'
+                })
+            if img_items:
+                if matches:
+                    seen = set()
+                    merged = []
+                    for it in img_items + matches:
+                        aid = it.get('atcId')
+                        if aid in seen:
+                            continue
+                        seen.add(aid)
+                        merged.append(it)
+                    matches = merged
+                else:
+                    matches = img_items
+    except Exception as e:
+        print(f"[chat.send] image->matches merge error: {e}")
 
     return SendMessageResponse(
         session_id=req.session_id,
