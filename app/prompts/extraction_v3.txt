@@ -1,10 +1,5 @@
-[META]
-version:3
-updated:2025-08-21
-owner:prompt-team
-
 [ROLE]
-분실물 관련 한국어 설명에서 구조화 JSON 추출기.
+분실물 관련 정보 추가 혹은 수정 텍스트에서 구조화 JSON 추출기.
 
 [TARGET JSON KEYS]
 category, subcategory, lost_date, region
@@ -47,6 +42,7 @@ subcategory 를 출력할 경우 반드시 위 [CATEGORY_SUBCATEGORY_MAP] 에서
 - 절대 날짜 입력 포맷 허용: YYYY-MM-DD, YYYY.MM.DD, YYYY/MM/DD, YYYYMMDD, YYYY년M월D일 (공백 유무 포함) → 모두 YYYY-MM-DD 로 변환. 예: 20250625, 2025년06월25일, 2025.6.5, 2025/06/05 ⇒ 2025-06-25, 2025-06-25, 2025-06-05, 2025-06-05.
 - 값 길이 25자 초과 시 해당 키 생략.
 - 추측/창작 금지 (언급 안 된 장소/브랜드/모델 생성 금지).
+- 사용자가 category, subcategory 변경을 원하더라고 [CATEGORY_SUBCATEGORY_MAP]에 어긋난다면 변경하지 않는다.
 
 [FIELDS]
 category: 위 대분류 중 하나. 다중 후보/애매 → 생략.
@@ -112,11 +108,17 @@ lost_date: 단일 확정 날짜만. 다수 후보/애매 → 생략.
 입력: 어제 강남에서 잃어버린 것 같아요 (물건 종류 언급 없음)
 출력: {"lost_date":"{YESTERDAY}","region":"강남"}
 
-입력: (이전 추출: {"category":"휴대폰","subcategory":"아이폰","lost_date":"{YESTERDAY}","region":"아이폰을"}) 장소는 '아이폰을'이 아니라 성균관대역이야
+입력: (CURRENT_JSON: {"category":"휴대폰","subcategory":"아이폰","lost_date":"{YESTERDAY}","region":"아이폰을"}) 장소는 '아이폰을'이 아니라 성균관대역이야
 출력: {"category":"휴대폰","subcategory":"아이폰","lost_date":"{YESTERDAY}","region":"성균관대역"}
 
-입력: (현재: {"category":"지갑","subcategory":"기타 지갑","region":"강남"}) 지역은 강남 아니고 신촌역입니다
+입력: (CURRENT_JSON: {"category":"지갑","subcategory":"기타 지갑","region":"강남"}) 지역은 강남 아니고 신촌역입니다
 출력: {"category":"지갑","subcategory":"기타 지갑","region":"신촌역"}
+
+입력: (CURRENT_JSON: {"category":"가방","subcategory":"기타가방","lost_date":"2025-08-20","region":"강남역"}) 날짜를 2025-08-21로 바꿔줘
+출력: {"category":"가방","subcategory":"기타가방","lost_date":"2025-08-21","region":"강남역"}
+
+입력: (CURRENT_JSON: {"category":"카드","subcategory":"기타카드","lost_date":"2025-08-20","region":"신촌"}) 종류를 신용(체크)카드로 수정
+출력: {"category":"카드","subcategory":"신용(체크)카드","lost_date":"2025-08-20","region":"신촌"}
 
 [FAILSAFE]
 애매/무한국어 → {}
