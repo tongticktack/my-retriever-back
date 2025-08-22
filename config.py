@@ -9,15 +9,9 @@ class Settings(BaseSettings):
     FIREBASE_CREDENTIALS_JSON_STRING: Optional[str] = None
     FIREBASE_STORAGE_BUCKET: Optional[str] = None  # firebase storage bucket name (e.g. my-app.appspot.com)
 
-    # Gemini (AI Studio)
-    GEMINI_API_KEY: Optional[str] = None
-    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
-
-    # (Gemini 사용 여부는 GEMINI_API_KEY 존재로 판단)
-
     # LLM 선택 및 설정
     LLM_PROVIDER: str = "auto"
-    LLM_AUTO_PRIORITY: str = "gemini,openai,echo"
+    LLM_AUTO_PRIORITY: str = "openai,echo"
     LLM_MAX_HISTORY_MESSAGES: int = 20
 
     # OpenAI
@@ -25,9 +19,8 @@ class Settings(BaseSettings):
     OPENAI_MODEL_NAME: str = "gpt-4o-mini"
     # (텍스트 임베딩 제거됨)
     
-    # Image embedding (텍스트/멀티모달 제거 후 단일 이미지 벡터만 사용)
-    EMBEDDING_PROVIDER: str = "hash"  # hash | gemini | openai (텍스트 경로 제거)
-    EMBEDDING_IMAGE_MODEL: str = "gemini-1.5-flash"  # (필요 시 교체 예정)
+    # Image embedding (OpenAI 단일 사용; 미지원 시 hash fallback)
+    EMBEDDING_PROVIDER: str = "openai"  # openai (기본) | hash (fallback)
     EMBEDDING_DIM_IMAGE: int = 512
     EMBEDDING_VERSION: str = "v1"
 

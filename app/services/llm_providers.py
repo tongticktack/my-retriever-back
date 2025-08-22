@@ -6,9 +6,8 @@ Usage:
   reply = llm.generate(messages=[{"role": "user", "content": "Hello"}])
 
 Providers:
-  - EchoProvider: deterministic echo, for tests/local
-  - GeminiProvider: Google Vertex AI Gemini
-  - OpenAIProvider: OpenAI Chat Completions
+    - EchoProvider: deterministic echo, for tests/local
+    - OpenAIProvider: OpenAI Chat Completions
 
 Add new provider by implementing BaseLLMProvider.
 """
@@ -17,11 +16,6 @@ from typing import List, Dict, Any, Optional
 import abc
 
 from config import settings
-
-try:
-    import google.generativeai as genai  # type: ignore
-except Exception:  # pragma: no cover
-    genai = None  # type: ignore
 
 try:
     import openai  # type: ignore
@@ -59,51 +53,7 @@ class EchoProvider(BaseLLMProvider):
         # expose a model attribute for uniform access
         self.model = self.name
         return last_user
-
-
-class GeminiProvider(BaseLLMProvider):
-    name = "gemini"
-
-    def __init__(self):
-        if not settings.GEMINI_API_KEY:
-            raise RuntimeError("GEMINI_API_KEY missing for Gemini provider (AI Studio)")
-        if genai is None:
-            raise RuntimeError("google-generativeai not installed")
-        genai.configure(api_key=settings.GEMINI_API_KEY)
-        self.model = settings.GEMINI_MODEL_NAME
-
-    def generate(self, messages: List[ChatMessage], **kwargs) -> str:
-        # Convert chat history to a prompt: keep system separate if present
-        system_parts = [m["content"] for m in messages if m.get("role") == "system"]
-        chat_pairs = []
-        for m in messages:
-            r = m.get("role")
-            if r == "user":
-                chat_pairs.append(f"User: {m['content']}")
-            elif r == "assistant":
-                chat_pairs.append(f"Assistant: {m['content']}")
-        prompt = "\n".join(system_parts + chat_pairs + ["Assistant:"])
-        try:
-            resp = genai.GenerativeModel(self.model).generate_content(prompt)
-            # resp.text (새 SDK) 또는 candidates 검사
-            text = getattr(resp, "text", None)
-            if text:
-                self._last_status = "ok"
-                return text.strip()
-            # fallback extraction
-            if getattr(resp, "candidates", None):
-                cand = resp.candidates[0]
-                parts = getattr(cand, "content", getattr(cand, "parts", []))
-                if parts:
-                    maybe = getattr(parts[0], "text", str(parts[0]))
-                    self._last_status = "ok"
-                    return str(maybe)[:1000]
-            self._last_status = "fallback"
-            return "(응답 비어있음)"
-        except Exception as e:  # pragma: no cover
-            self._last_status = "fallback"
-            return "(임시 응답 지연) 잠시 후 다시 시도해주세요."
-
+        
 
 class OpenAIProvider(BaseLLMProvider):
     name = "openai"
@@ -156,7 +106,7 @@ class AutoProvider(BaseLLMProvider):
         self.last_provider: Optional[str] = None
         # Parse priority list once
         raw = (settings.LLM_AUTO_PRIORITY or "").split(",")
-        cleaned = [p.strip().lower() for p in raw if p.strip()]
+        cleaned = [p.strip().lower() for p in raw if p.strip() and p.strip().lower() != "gemini"]
         # Guarantee echo fallback at end
         if "echo" not in cleaned:
             cleaned.append("echo")
@@ -166,9 +116,7 @@ class AutoProvider(BaseLLMProvider):
         if name in self._instances:
             return self._instances[name]
         try:
-            if name == "gemini" and settings.GEMINI_API_KEY:
-                inst = GeminiProvider()
-            elif name == "openai":
+            if name == "openai":
                 inst = OpenAIProvider()
             elif name == "echo":
                 inst = EchoProvider()
@@ -210,12 +158,6 @@ def get_llm() -> BaseLLMProvider:
     if provider == "auto":
         _singleton = AutoProvider()
         return _singleton
-    if provider == "gemini" and settings.GEMINI_API_KEY:
-        try:
-            _singleton = GeminiProvider()
-            return _singleton
-        except Exception as e:
-            print("[llm] Gemini init failed, falling back to echo:", e)
     if provider == "openai":
         try:
             _singleton = OpenAIProvider()

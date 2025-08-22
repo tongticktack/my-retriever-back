@@ -3,8 +3,7 @@ uvicorn[standard]
 gunicorn
 firebase-admin
 pydantic-settings
-# Gemini (AI Studio)
-google-generativeai
+
 # 이미지 처리
 Pillow
 # 벡터/임베딩 인덱스

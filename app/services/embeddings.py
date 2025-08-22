@@ -1,10 +1,7 @@
-"""Image embedding service abstraction (text embedding 제거).
+"""Image embedding service abstraction (OpenAI 단일 경로 + hash fallback).
 
-지원 provider:
-    - hash (deterministic local hashing 기본)
-    - openai / gemini: 현재 실제 이미지 임베딩 미사용 시 hash fallback
-
-FAISS index 는 이제 이미지 벡터만 유지.
+현재 실제 OpenAI 이미지 embedding 모델 미사용 → hash 기반 대체.
+나중에 교체 시 PROVIDER == "openai" 분기 확장.
 """
 from __future__ import annotations
 import hashlib
@@ -14,11 +11,8 @@ import numpy as np
 from config import settings
 
 PROVIDER = settings.EMBEDDING_PROVIDER.lower()
-
 IMAGE_DIM = settings.EMBEDDING_DIM_IMAGE
-
-_openai_client = None  # (보류: 이미지 전용 실제 모델 도입 시 확장)
-_gemini_ready = False
+_openai_client = None  # reserved
 
 
 def _l2_normalize(vec: np.ndarray) -> np.ndarray:
@@ -33,12 +27,7 @@ def _hash_to_vec(data: bytes, dim: int) -> np.ndarray:
 
 
 def embed_image(image_bytes: bytes) -> np.ndarray:
-    if PROVIDER == "hash":
-        return _hash_to_vec(image_bytes, IMAGE_DIM)
-    if PROVIDER == "gemini":
-        # AI Studio 현재 공식 멀티모달 embedding 별도 모델 미제공 → 해시 대체 (추후 교체)
-        return _hash_to_vec(image_bytes, IMAGE_DIM)
-    # OpenAI: 현재 공개 이미지 임베딩 모델 미사용 → 해시 fallback
+    # TODO: OpenAI 이미지 embedding API 도입 시 구현
     return _hash_to_vec(image_bytes, IMAGE_DIM)
 
 
