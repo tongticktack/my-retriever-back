@@ -4,48 +4,50 @@ const axios = require("axios");
 
 admin.initializeApp();
 
-// --- 환경 변수 ---
-const SERVICE_KEY = functions.config().police.service_key;
-const KAKAO_API_KEY = functions.config().kakao.key; // 🔑 카카오맵 API 키
-const API_URL_police = functions.config().police.url_police;
-const API_URL_portal = functions.config().police.url_portal;
+const SERVICE_KEY = functions.config().police.service_key; //공공데이터 포털 api 서비스 키
+const KAKAO_API_KEY = functions.config().kakao.key; // 카카오맵 api 키
+const API_URL_police = functions.config().police.url_police; // 경찰청 api url
+const API_URL_portal = functions.config().police.url_portal; // 포털기관 api url
 
-// --- 함수 실행 옵션 ---
 const runtimeOpts = {
   timeoutSeconds: 540,
   memory: "512MB",
-};
+}; // 런타임 옵션(9분, 512MB)
 
-// --- 잠시 기다리는 함수 (재시도를 위해) ---
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)); // 재시도 대기 시간 함수
 
-// --- YYYYMMDD 형식 날짜 변환 함수 ---
+
 const getFormattedDate = (date) => {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, '0');
   const day = String(date.getDate()).padStart(2, '0');
   return `${year}${month}${day}`;
 };
+const today = new Date(new Date().getTime() + (9 * 60 * 60 * 1000));
+const yesterday = new Date(today);
+yesterday.setDate(today.getDate() - 1);
+const yesterdayStr = getFormattedDate(yesterday);
+// daily 호출용 YYYYMMDD 형식 날짜 변환 함수
 
-// --- 카카오맵 API 호출을 위한 공통 함수 ---
+// 카카오맵 API 호출을 위한 공통 함수
+// 경찰청/포털기관 선택
 const getCoordinates = async (query, docId, collectionName) => {
   if (!query) return null;
   const kakaoApiUrl = `https://dapi.kakao.com/v2/local/search/keyword.json`;
-  // 👇 [수정됨] 최대 재시도 횟수를 4회로 늘렸습니다.
+  // 최대 재시도 4번
   const MAX_RETRIES = 4;
   for (let i = 0; i < MAX_RETRIES; i++) {
     try {
       const kakaoResponse = await axios.get(kakaoApiUrl, {
         params: { query: query },
         headers: { Authorization: `KakaoAK ${KAKAO_API_KEY}` },
-        timeout: 11000,
+        timeout: 13000,
       });
       const documents = kakaoResponse.data.documents;
-      if (documents && documents.length > 0) return documents[0]; // 성공 시 첫 번째 결과 반환
+      if (documents && documents.length > 0) return documents[0]; // 검색 성공 시 첫 번째 결과 좌표
       return null;
     } catch (error) {
-      if (error.response && error.response.status === 429) {
-        // 👇 [수정됨] 재시도 대기 시간을 1.5배로 늘렸습니다. (1.5초, 3초, 6초, 12초)
+      if (error.response && error.response.status === 429) { // API 사용량 초과 시 재시도
         const waitTime = Math.pow(2, i) * 1500;
         console.warn(`[${collectionName} 좌표] ${docId} API 사용량 초과(429). ${waitTime}ms 후 재시도...`);
         await delay(waitTime);
@@ -55,27 +57,18 @@ const getCoordinates = async (query, docId, collectionName) => {
       }
     }
   }
-  console.error(`[${collectionName} 좌표] ${docId} 최대 재시도 횟수(${MAX_RETRIES})를 초과했습니다.`);
+  console.error(`[${collectionName} 좌표] ${docId} 최대 재시도 횟수(${MAX_RETRIES})를 초과`);
   return null;
 };
 
-
-// ===================================================================
-//   1. 모든 데이터 처리를 위한 공통 함수
-// ===================================================================
+// 데이터 수집 가공 기록
 const collectAndProcessData = async (apiUrl, collectionName, logPrefix) => {
-  // 1-1. KST 기준 '어제' 날짜 계산
-  const today = new Date(new Date().getTime() + (9 * 60 * 60 * 1000));
-  const yesterday = new Date(today);
-  yesterday.setDate(today.getDate() - 1);
-  const yesterdayStr = getFormattedDate(yesterday);
-  console.log(`ℹ️ [${logPrefix}] 어제 날짜(${yesterdayStr}) 데이터 수집을 시작합니다.`);
 
-  // 1-2. API 호출
+  // api 호출
   const response = await axios.get(apiUrl, {
     params: {
       serviceKey: SERVICE_KEY,
-      START_YMD: yesterdayStr,
+      START_YMD: yesterdayStr, // 어제 날짜
       END_YMD: yesterdayStr,
       numOfRows: "2000",
       _type: "json"
@@ -86,24 +79,23 @@ const collectAndProcessData = async (apiUrl, collectionName, logPrefix) => {
   if (items.length === 0) {
     console.log(`[${logPrefix}] API에서 어제 날짜 데이터가 없습니다.`);
     return `[${logPrefix}] API에서 어제 날짜 데이터가 없습니다.`;
-  }
-  console.log(`✅ [${logPrefix}] API 처리 완료: ${items.length}건`);
+  } // 데이터 없을 경우 종료
+  console.log(`[${logPrefix}] API 처리 완료: ${items.length}건`);
 
-  // 1-3. 좌표 검색 및 주소 문자열 필터링
-  console.log(`ℹ️ [${logPrefix}] ${items.length}건에 대한 좌표 검색 및 필터링 시작...`);
+  // 주소 & 좌표 검색 및 필터링
   const enrichedItems = await Promise.all(items.map(async (item) => {
-    const place = item.depPlace;
-    const kakaoResult = await getCoordinates(place, item.atcId, logPrefix);
-    
+    const place = item.depPlace; //보관 장소 기준 검색
+    const kakaoResult = await getCoordinates(place, item.atcId, logPrefix); //좌표 & 주소 검색
+
     if (kakaoResult) {
       const addressString = kakaoResult.road_address_name || kakaoResult.address_name || "";
-      if (addressString.includes("서울") || addressString.includes("수원")) {
+      if (addressString.includes("서울") || addressString.includes("수원")) { // 서울/수원 주소 필터링
         const lat = parseFloat(kakaoResult.y);
         const lng = parseFloat(kakaoResult.x);
         return {
           ...item,
-          location: new admin.firestore.GeoPoint(lat, lng),
-          addr: addressString,
+          location: new admin.firestore.GeoPoint(lat, lng), // Firestore GeoPoint 좌표 추가
+          addr: addressString,  // 주소 정보 추가
         };
       }
     }
@@ -114,45 +106,44 @@ const collectAndProcessData = async (apiUrl, collectionName, logPrefix) => {
   if (finalItemsToSave.length === 0) {
     console.log(`[${logPrefix}] 필터링 후 저장할 데이터가 없습니다.`);
     return `[${logPrefix}] 필터링 후 저장할 데이터가 없습니다.`;
-  }
-  console.log(`✅ [${logPrefix}] 주소 필터링 완료: ${finalItemsToSave.length}건`);
+  } // 필터링 후 데이터가 없으면 종료
+  console.log(`[${logPrefix}] 주소 필터링 완료: ${finalItemsToSave.length}건`);
 
-  // 1-4. Firestore에 저장
+  // Firestore 저장
   const db = admin.firestore();
   const batch = db.batch();
-  const collectionRef = db.collection(collectionName);
+  const collectionRef = db.collection(collectionName); // 경찰청/포털기관 컬렉션 저장
   finalItemsToSave.forEach(item => {
     const docRef = collectionRef.doc(item.atcId);
     const processedItem = {
-      atcId: item.atcId || null, itemName: item.fdPrdtNm || null,
-      itemCategory: item.prdtClNm || null, foundDate: item.fdYmd || null,
-      storagePlace: item.depPlace || null,
-      addr: item.addr || null,
-      location: item.location || null,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      imageUrl: item.fdFilePathImg || null
+      atcId: item.atcId || null, // 고유 식별 번호
+      itemName: item.fdPrdtNm || null, // 물품명
+      itemCategory: item.prdtClNm || null, // 물품 카테고리
+      foundDate: item.fdYmd || null, // 습득 일자
+      storagePlace: item.depPlace || null, // 보관 장소
+      addr: item.addr || null, // 주소
+      location: item.location || null, // 좌표
+      createdAt: admin.firestore.FieldValue.serverTimestamp(), // 생성 일시
+      imageUrl: item.fdFilePathImg || null  // 이미지 URL
     };
     batch.set(docRef, processedItem);
   });
   await batch.commit();
 
-  return `✅ 성공! [${logPrefix}] 최종 ${finalItemsToSave.length}건의 데이터를 Firestore에 저장했습니다.`;
+  return `[${logPrefix}] 최종 ${finalItemsToSave.length}건의 데이터를 Firestore에 저장`;
 };
 
-
-// ===================================================================
-//   2. 각 API를 호출하는 HTTP 트리거 함수들
-// ===================================================================
+// 기관별 api 호출 및 데이터 수집 함수
 exports.collectPoliceData = functions
   .region("asia-northeast3")
   .runWith(runtimeOpts)
   .https.onRequest(async (req, res) => {
     try {
-      const message = await collectAndProcessData(API_URL_police, "testPoliceLostItem", "경찰청");
+      const message = await collectAndProcessData(API_URL_police, "PoliceLostItem", "경찰청");
       console.log(message);
       res.status(200).send(message);
     } catch (error) {
-      console.error("🚨 경찰청 함수 실행 중 오류:", error.message);
+      console.error("경찰청 함수 실행 중 오류:", error.message);
       res.status(500).send("오류 발생");
     }
   });
@@ -162,11 +153,11 @@ exports.collectPortalData = functions
   .runWith(runtimeOpts)
   .https.onRequest(async (req, res) => {
     try {
-      const message = await collectAndProcessData(API_URL_portal, "testPortalLostItem", "포털기관");
+      const message = await collectAndProcessData(API_URL_portal, "PortalLostItem", "포털기관");
       console.log(message);
       res.status(200).send(message);
     } catch (error) {
-      console.error("🚨 포털기관 함수 실행 중 오류:", error.message);
+      console.error("포털기관 함수 실행 중 오류:", error.message);
       res.status(500).send("오류 발생");
     }
   });
