@@ -126,3 +126,46 @@ docker run -d -p 8000:8000 \
 - `-p 8000:8000`: 호스트의 8000번 포트를 컨테이너의 8000번 포트와 매핑합니다.
 - `-e ...`: 컨테이너 내부에 환경 변수를 설정합니다. `cat` 명령어로 `firebase-credentials.json` 파일의 내용을 통째로 읽어 주입합니다.
 - `--name`: 컨테이너에 `my-retriever-app`이라는 이름을 부여합니다.
+
+## 이미지 인덱싱 실행 및 자동화
+
+### 즉시 인덱싱 실행
+
+
+아래 명령어로 DB 이미지 인덱싱을 즉시 실행할 수 있습니다.
+
+```bash
+python app/scripts/db_image_indexer.py
+```
+
+- 옵션: `--limit N` 으로 인덱싱할 최대 아이템 수를 지정할 수 있습니다.
+   ```bash
+   python app/scripts/db_image_indexer.py --limit 100
+   ```
+- 실행 결과와 통계가 콘솔에 출력됩니다.
+
+### 크론(cron)으로 주기적 자동 실행
+
+
+`app/scripts/db_image_indexer.py`를 crontab에 등록하여 매일 새벽 4시에 자동 실행할 수 있습니다.
+
+#### 설정 방법
+
+1. 실행 권한 부여:
+   ```bash
+   chmod +x app/scripts/db_image_indexer.py
+   ```
+2. crontab 편집:
+   ```bash
+   crontab -e
+   ```
+3. 아래 줄 추가 (경로는 실제 프로젝트 위치로 변경):
+   ```
+   0 4 * * * /usr/bin/python3 /path/to/my-retriever-back/app/scripts/db_image_indexer.py >> /path/to/my-retriever-back/logs/image_indexing.log 2>&1
+   ```
+- 로그는 `logs/image_indexing.log`에 기록됩니다.
+- 상세 인덱싱 로그 및 통계는 스크립트에서 자동 기록됩니다.
+
+## 운영/로그 관리
+- 인덱싱 상세 로그(컬렉션, image_url, 통계)는 `app/scripts/db_image_indexer.py`에서 자동 기록됩니다.
+- 모든 로그는 `logs/` 폴더에 저장되며, 인덱싱 상세 로그는 `logs/image_indexing.log`에 기록됩니다.

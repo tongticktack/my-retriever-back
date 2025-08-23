@@ -16,3 +16,5 @@ openai # optional, for OpenAI provider
 pytest
 sentence-transformers
 torch
+aiohttp
+numpy
