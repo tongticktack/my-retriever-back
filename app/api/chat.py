@@ -176,6 +176,7 @@ def send_message(req: SendMessageRequest):
                 existing = set(active.get("media_ids") or [])
                 active["media_ids"] = list(existing.union(mid_list))
     user_lower = req.content.strip().lower()
+    # Start-new trigger keywords retained but no longer required after a confirmed search; user can just describe a new item.
     start_new_trigger = any(kw in user_lower for kw in ["또 잃어버렸", "다른 물건", "새 물건", "추가 물건"]) or user_lower.startswith("새 물건")
 
     # Vision LLM: 이미지 URL 목록 (공개 URL 기준) 추출하여 controller 전달
@@ -185,7 +186,7 @@ def send_message(req: SendMessageRequest):
     if multi_image_conflict:
         assistant_reply = (
             "여러 이미지가 서로 다른 물건으로 보입니다. 한 번에 하나의 분실물 이미지(최대 3장: 같은 물건 다른 각도)만 첨부해주세요. "
-            "각 물건은 별도 메시지 또는 '새 물건' 입력 후 이미지를 올려주세요."
+            "새로운 분실물이라면 그냥 새 물건 설명 또는 사진을 바로 보내주셔도 됩니다."
         )
         chosen_model = "multi-image-validation"
         active_item_snapshot = None

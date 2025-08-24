@@ -538,20 +538,49 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
         current["stage"] = "confirmed"
         snapshot = _snapshot(idx, current)
         # Run approximate external search now (after explicit user confirm)
-        search_msg = "공개 습득물 근사 검색을 시작합니다."
+        # External approximate search (results saved to state only; reply gives dynamic high-level feedback)
+        extracted_payload = current.get("extracted") or {}
+        search_error = False
+        matches = None
         try:
-            extracted_payload = current.get("extracted") or {}
-            matches = external_search.approximate_external_matches(extracted_payload, place_query=extracted_payload.get('region'), max_results=5)
+            matches = external_search.approximate_external_matches(
+                extracted_payload,
+                place_query=extracted_payload.get('region'),
+                max_results=5
+            )
             if matches:
                 current['external_matches'] = matches
-                summary_line = external_search.summarize_matches(matches, limit=3)
-                search_msg += "\n\n" + summary_line
-            else:
-                search_msg += "\n(현재 정보로 즉시 유사 후보 없음)"
         except Exception as e:
             print('[external_search] confirm-stage search failed', e)
-            search_msg += "\n(검색 중 오류가 발생했어요. 잠시 후 다시 시도해주세요.)"
-        search_msg += "\n다른 분실물을 새로 등록하려면 '새 물건'이라고 입력하시면 됩니다."
+            search_error = True
+
+        match_count = len(matches) if matches else 0
+        if search_error:
+            search_msg = (
+                "검색 중 잠시 문제가 있었어요. 조금 뒤 다시 시도해 볼게요. 일단 추출된 정보는 저장해 두었어요. "
+                "혹시 추가 단서(색상, 특징, 더 정확한 장소)가 있다면 말씀해주세요!"
+            )
+        elif match_count == 0:
+            search_msg = (
+                "아직 바로 떠오르는 공개 습득물 후보는 없어요. "
+                "조금 더 구체적인 특징(색상, 브랜드, 세부 장소)을 알려주시면 다시 더 잘 찾아볼게요!"
+            )
+        elif match_count == 1:
+            search_msg = (
+                "루시가 가능한 후보 1개를 찾아왔어요 멍멍! 화면에 보이는 후보가 맞는지 확인해 주세요. "
+                "다른 단서가 있으면 더 알려주세요."
+            )
+        elif match_count <= 3:
+            search_msg = (
+                f"루시가 유력한 후보 {match_count}개를 물고 왔어요 멍멍! 화면의 목록을 확인해 주세요. "
+                "맞는 것이 없다면 추가 특징을 말씀해 주시면 더 좁혀볼게요."
+            )
+        else:
+            search_msg = (
+                f"루시가 관련 있어 보이는 후보 {match_count}개를 찾았어요. 상위 일부만 먼저 보여드렸어요. "
+                "더 세밀한 단서를 주시면 결과를 더 정밀하게 좁힐 수 있어요!"
+            )
+        search_msg += "\n새 분실물이 있다면 그냥 새로 설명을 시작해 주시면 돼요 (특별한 명령어 필요 없음)."
         snapshot = _snapshot(idx, current)
         return (search_msg, lost_state, "lost-item-flow.v2", snapshot)
     if current.get("stage") == "ready" and intent == 'cancel':
