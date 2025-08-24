@@ -3,18 +3,14 @@ uvicorn[standard]
 gunicorn
 firebase-admin
 pydantic-settings
-
-# 이미지 처리
 Pillow
-# 벡터/임베딩 인덱스
 faiss-cpu
 numpy
-# 고성능 JSON 직렬화 (선택)
 orjson
 python-multipart
 openai # optional, for OpenAI provider
 pytest
 sentence-transformers
-torch
 aiohttp
 numpy
+torch --index-url https://download.pytorch.org/whl/cpu

@@ -1,86 +1,107 @@
-import firebase_admin
+# main.py
 import json
+import uuid
+from time import time
+
+import firebase_admin
 from fastapi import FastAPI, Request
 from firebase_admin import credentials
 
 from config import settings
+from logging_config import setup_logging, get_logger, set_request_id
 
-# Firebase init (credentials JSON 기반 bucket 고정)
+# 1) 로깅 설정(최우선)
+# 운영 환경에서 JSON 로그를 원하면 json_fmt=True
+setup_logging(json_fmt=False)
+logger = get_logger(__name__)
+
+# 2) Firebase 초기화
 cred_obj = None
 bucket_from_json = None
-if settings.FIREBASE_CREDENTIALS_JSON_STRING:
-    cred_info = json.loads(settings.FIREBASE_CREDENTIALS_JSON_STRING)
-    bucket_from_json = cred_info.get('storage_bucket') or cred_info.get('storageBucket')
-    cred_obj = credentials.Certificate(cred_info)
-elif settings.GOOGLE_APPLICATION_CREDENTIALS:
-    try:
-        with open(settings.GOOGLE_APPLICATION_CREDENTIALS, 'r', encoding='utf-8') as f:
-            ci = json.load(f)
-            bucket_from_json = ci.get('storage_bucket') or ci.get('storageBucket')
-    except Exception:
-        bucket_from_json = None
-    cred_obj = credentials.Certificate(settings.GOOGLE_APPLICATION_CREDENTIALS)
 
-if cred_obj:
-    init_options = {}
-    # 환경변수 무시, credentials JSON 의 storage_bucket 만 사용 (없으면 project_id 기반 자동)
-    chosen_bucket = bucket_from_json
-    if not chosen_bucket:
+try:
+    if settings.FIREBASE_CREDENTIALS_JSON_STRING:
+        cred_info = json.loads(settings.FIREBASE_CREDENTIALS_JSON_STRING)
+        bucket_from_json = cred_info.get('storage_bucket') or cred_info.get('storageBucket')
+        cred_obj = credentials.Certificate(cred_info)
+        logger.info("Firebase credentials loaded from FIREBASE_CREDENTIALS_JSON_STRING.")
+    elif settings.GOOGLE_APPLICATION_CREDENTIALS:
         try:
-            # project id 로 fall back
-            from firebase_admin import _project_id  # internal; fallback if available
-        except Exception:
-            _project_id = None
-        # firebase_admin.get_app() 이전이라 project id 추출 어려움 -> credentials JSON 없으면 이후 media_store 에서 유추
-    if chosen_bucket:
-        init_options['storageBucket'] = chosen_bucket
-    firebase_admin.initialize_app(cred_obj, init_options or None)
-else:
-    print("WARNING: Firebase credentials not found. Firebase features will be disabled.")
+            with open(settings.GOOGLE_APPLICATION_CREDENTIALS, 'r', encoding='utf-8') as f:
+                ci = json.load(f)
+                bucket_from_json = ci.get('storage_bucket') or ci.get('storageBucket')
+            cred_obj = credentials.Certificate(settings.GOOGLE_APPLICATION_CREDENTIALS)
+            logger.info("Firebase credentials loaded from GOOGLE_APPLICATION_CREDENTIALS file.")
+        except Exception as e:
+            bucket_from_json = None
+            logger.warning("Failed to read GOOGLE_APPLICATION_CREDENTIALS file: %s", e)
 
+    if cred_obj:
+        init_options: dict = {}
+        chosen_bucket = bucket_from_json  # JSON의 storage_bucket 우선
+        if chosen_bucket:
+            init_options['storageBucket'] = chosen_bucket
+            logger.info("Firebase init with storageBucket=%s", chosen_bucket)
+        else:
+            logger.info("Firebase init without explicit storageBucket (project-id fallback may apply).")
+
+        firebase_admin.initialize_app(cred_obj, init_options or None)
+        logger.info("Firebase initialized successfully.")
+    else:
+        logger.warning("Firebase credentials not found. Firebase features will be disabled.")
+except Exception as e:
+    logger.exception("Firebase initialization failed: %s", e)
+
+# 3) FastAPI 앱
 app = FastAPI(title="Loosy Lost & Found API")
 
-# Simple structured logging middleware (can be replaced by proper logger)
+# 4) 요청 로깅 미들웨어
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    from time import time
+    rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    set_request_id(rid)
+
     start = time()
     path = request.url.path
     method = request.method
     query = request.url.query
     client_ip = getattr(request.client, 'host', '-') if request.client else '-'
-    ua = request.headers.get('user-agent','')[:120]
-    # Read small bodies for debug (avoid large file uploads)
+    ua = request.headers.get('user-agent', '')[:120]
+
     body_preview = ""
     try:
-        if request.method in {"POST","PUT","PATCH"}:
+        if method in {"POST", "PUT", "PATCH"}:
             body_bytes = await request.body()
             if body_bytes:
-                body_preview = body_bytes[:300].decode('utf-8','ignore')
+                body_preview = body_bytes[:300].decode('utf-8', 'ignore')
                 if len(body_bytes) > 300:
                     body_preview += "..."
     except Exception:
         body_preview = "<unreadable>"
+
     if method == 'GET' and query:
-        print(f"[req:start] {method} {path}?{query} ip={client_ip} ua={ua!r}")
+        logger.info("REQ start %s %s?%s ip=%s ua=%r", method, path, query, client_ip, ua)
     else:
-        print(f"[req:start] {method} {path} ip={client_ip} ua={ua!r} body={body_preview!r}")
+        logger.info("REQ start %s %s ip=%s ua=%r body=%r", method, path, client_ip, ua, body_preview)
+
     try:
         response = await call_next(request)
         return response
     finally:
         duration = (time() - start) * 1000
         status = getattr(locals().get('response', None), 'status_code', 'NA')
-        size = '-'  # attempt to read content-length header
+        size = '-'
         try:
             size = response.headers.get('content-length') if 'response' in locals() else '-'
         except Exception:
             pass
-        if method == 'GET' and query:
-            print(f"[req:end] {method} {path}?{query} status={status} {duration:.1f}ms size={size}")
-        else:
-            print(f"[req:end] {method} {path} status={status} {duration:.1f}ms size={size}")
 
+        if method == 'GET' and query:
+            logger.info("REQ end %s %s?%s status=%s %.1fms size=%s", method, path, query, status, duration, size)
+        else:
+            logger.info("REQ end %s %s status=%s %.1fms size=%s", method, path, status, duration, size)
+
+# 5) CORS (optional)
 try:
     from fastapi.middleware.cors import CORSMiddleware
     allowed_origins = [
@@ -95,18 +116,20 @@ try:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    logger.info("CORS middleware configured for %s", allowed_origins)
 except Exception as e:
-    print("WARNING: CORS middleware not added:", e)
+    logger.warning("CORS middleware not added: %s", e)
 
-# Routers
+# 6) 라우터
 from app.api import items, chat, lost_item, media
 from app.services import faiss_index
+
 app.include_router(items.router)
 app.include_router(chat.router)
 app.include_router(lost_item.router)
 app.include_router(media.router)
 
-
+# 7) 엔드포인트
 @app.get("/")
 def root():
     return {"message": "Loosy backend modular 구조 준비", "routes": [
@@ -116,14 +139,12 @@ def root():
         "/chat/send",
         "/chat/history/{session_id}",
         "/lost/analyze",
-        "/media/upload"
+        "/media/upload",
     ]}
-
 
 @app.post("/admin/reindex")
 def admin_reindex(force: bool = False):
     changed = faiss_index.reindex_all(force=force)
+    logger.info("Admin reindex requested: force=%s, changed=%s, embedding_version=%s",
+                force, changed, faiss_index.EMBEDDING_VERSION)
     return {"reindexed": changed, "embedding_version": faiss_index.EMBEDDING_VERSION}
-
-
-# Removed lost112 proxy helper per request (no proxy endpoints exposed)
