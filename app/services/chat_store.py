@@ -143,6 +143,7 @@ def fetch_messages(session_id: str, limit: int = 50) -> List[Dict]:
             "created_at": created_str,
             "model": data.get("model"),
             "attachments": data.get("attachments"),
+            "matches": data.get("matches"),  # persisted matches for assistant messages
         })
     return list(reversed(messages))
 

@@ -26,6 +26,7 @@ EXPANDED_DATE_WINDOW_DAYS = getattr(settings, 'EXPANDED_DATE_WINDOW_DAYS', 30)  
 STRICT_DATE_MATCH_DAYS = getattr(settings, 'STRICT_DATE_MATCH_DAYS', 3)  # 최종 matches 에 허용되는 ±일 수
 # Text search configuration
 MIN_TEXT_SEARCH_SCORE = getattr(settings, 'MIN_TEXT_SEARCH_SCORE', 0.3)  # 최소 텍스트 검색 점수 임계값
+MAX_PERSISTED_MATCHES = 50 
 
 def _parse_iso_date(s: str) -> Optional[date]:
     if not s:
@@ -61,6 +62,7 @@ class Message(BaseModel):
     created_at: str
     model: str | None = None
     attachments: Optional[List[dict]] = None
+    matches: Optional[List[dict]] = None  # persisted candidate matches (assistant only)
 
 class SendMessageResponse(BaseModel):
     user_message: Message
@@ -325,13 +327,8 @@ def send_message(req: SendMessageRequest):
         chosen_model = getattr(llm, "last_model_name", None) or getattr(llm, "model", None) or getattr(llm, "name", "unknown")
         print(f"[chat.send] general_llm_done model={chosen_model} len={len(assistant_reply)}")
 
-    assistant_meta = {"model": chosen_model}
-    assistant_msg_id = chat_store.add_message(
-        req.session_id,
-        "assistant",
-        assistant_reply,
-        meta=assistant_meta
-    )
+    # (assistant message 저장은 matches 생성 이후로 이동 - 완전 저장)
+    assistant_msg_id = None  # placeholder; 실제 저장은 matches 계산 후
 
     # 최신 히스토리 일부 가져와 user 메시지 timestamp 포함 (limit=2 충분)
     try:
@@ -359,7 +356,7 @@ def send_message(req: SendMessageRequest):
     if user_meta and user_meta.get("attachments"):
         user_attachments = user_meta.get("attachments")
     # Build matches list (external, then internal text-fallback with image re-ranking)
-    matches = None
+    matches = None  # will hold full list we persist
     try:
         active_idx = lost_state.get("active_index")
         if active_idx is not None:
@@ -588,12 +585,38 @@ def send_message(req: SendMessageRequest):
     except Exception as e:
         print(f"[chat.send] strict date filter error: {e}")
 
+    # 최종 matches 정리 및 크기 제한 (완전 저장 모드: 최대 MAX_PERSISTED_MATCHES)
+    if matches is None:
+        matches = []
+    if len(matches) > MAX_PERSISTED_MATCHES:
+        matches = matches[:MAX_PERSISTED_MATCHES]
+
+    # assistant 메시지 Firestore 저장 (이 시점에 matches 결정됨)
+    assistant_meta = {
+        "model": chosen_model,
+        "matches": matches,  # 완전 저장
+    }
+    from datetime import datetime as _dt, timezone as _tz
+    assistant_meta["matches_generated_at"] = _dt.now(_tz.utc).isoformat()
+    try:
+        assistant_msg_id = chat_store.add_message(
+            req.session_id,
+            "assistant",
+            assistant_reply,
+            meta=assistant_meta
+        )
+    except Exception as e:
+        # 저장 실패 시 로그만 남기고 진행 (응답에는 matches 포함)
+        print(f"[chat.send] assistant message persist error: {e}")
+        if not assistant_msg_id:
+            assistant_msg_id = "assistant-save-failed"
+
     return SendMessageResponse(
         session_id=req.session_id,
         user_message=Message(id=user_msg_id, role="user", content=req.content, created_at=created_at, model=None, attachments=user_attachments),
-        assistant_message=Message(id=assistant_msg_id, role="assistant", content=assistant_reply, created_at=assistant_created_at, model=chosen_model, attachments=None),
+        assistant_message=Message(id=assistant_msg_id, role="assistant", content=assistant_reply, created_at=assistant_created_at, model=chosen_model, attachments=None, matches=matches),
         active_lost_item=active_item_snapshot,
-    matches=matches,
+        matches=matches,
     )
 
 @router.get("/history/{session_id}", response_model=HistoryResponse)
@@ -603,10 +626,14 @@ def history(session_id: str, limit: int = 50):
     except ValueError:
         raise HTTPException(404, "session_not_found")
     # pass through attachments if present
-    return HistoryResponse(
-        session_id=session_id,
-        messages=[Message(**m) for m in msgs]
-    )
+    enriched = []
+    for m in msgs:
+        # Firestore meta fields already flattened in fetch_messages; ensure matches included if stored
+        if 'matches' in m and m.get('matches'):
+            enriched.append(Message(**m))
+        else:
+            enriched.append(Message(**m))
+    return HistoryResponse(session_id=session_id, messages=enriched)
 
 
 @router.get("/sessions", response_model=SessionListResponse)
