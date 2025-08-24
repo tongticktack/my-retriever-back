@@ -73,8 +73,11 @@ def add_message(session_id: str, role: str, content: str, meta: Optional[Dict] =
     """
     db = get_db()
     trimmed = content.strip() if content is not None else ""
+    # Allow empty content when attachments are present (image-only message)
     if not trimmed:
-        raise ValueError("empty_content")
+        has_attachments = bool(meta and meta.get("attachments"))
+        if not has_attachments:
+            raise ValueError("empty_content")
     if len(trimmed) > 1000:
         raise ValueError("content_too_long")
 
@@ -110,6 +113,9 @@ def add_message(session_id: str, role: str, content: str, meta: Optional[Dict] =
                 # LLM 기반 타이틀 생성 시도 (실패하면 fallback)
                 from .title_generator import generate_session_title  # 지연 import
                 raw = trimmed.replace("\n", " ").strip()
+                if not raw:
+                    # Fallback for image-only first message
+                    raw = "이미지 첨부"
                 title = generate_session_title(raw)
                 updates["title"] = title
         except Exception:

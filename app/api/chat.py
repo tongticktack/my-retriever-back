@@ -51,7 +51,7 @@ class CreateSessionResponse(BaseModel):
 
 class SendMessageRequest(BaseModel):
     session_id: str
-    content: str
+    content: Optional[str] = ""  # 이제 이미지-only 메시지 허용 (media_ids 있으면 빈 문자열 허용)
     user_id: Optional[str] = None  # (미인증 상태라 사용 안하지만 필드 예약)
     media_ids: Optional[List[str]] = None  # 업로드된 이미지 참조 ID 목록
 
@@ -113,8 +113,10 @@ def send_message(req: SendMessageRequest):
             raise HTTPException(status_code=400, detail="invalid_media_id")
         if medias:
             user_meta = {"attachments": medias}
+    # 이미지 전용 메시지 허용: content 비어있고 media_ids 존재하면 내부적으로 빈 문자열 저장
+    safe_content = (req.content or "")
     try:
-        user_msg_id = chat_store.add_message(req.session_id, "user", req.content, meta=user_meta)
+        user_msg_id = chat_store.add_message(req.session_id, "user", safe_content, meta=user_meta)
     except ValueError as e:
         code = str(e)
         if code == "session_not_found":
