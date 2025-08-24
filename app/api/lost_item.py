@@ -29,6 +29,18 @@ class ListUserItemsResponse(BaseModel):
     user_id: str
     items: List[UserLostItem]
 
+class MarkFoundRequest(BaseModel):
+    user_id: str
+    item_index: int
+    found_match_id: Optional[str] = None  # 매칭된 공개 습득물 ID(optional)
+    note: Optional[str] = None
+
+class MarkFoundResponse(BaseModel):
+    user_id: str
+    item_index: int
+    is_found: bool
+    found_at: str
+
 @router.post("/analyze", response_model=AnalyzeResponse)
 def analyze(req: AnalyzeRequest):
     extracted = extractor.analyze_text(req.text)
@@ -52,3 +64,17 @@ def list_user_items(user_id: str, limit: int = 50, stage: Optional[str] = None):
         updated_at=i.get('updated_at'),
     ) for i in items_raw]
     return ListUserItemsResponse(user_id=norm, items=items)
+
+
+@router.post("/mark-found", response_model=MarkFoundResponse)
+def mark_found(req: MarkFoundRequest):
+    norm = (req.user_id or '').strip() or 'guest'
+    updated = lost_item_store.mark_item_found(norm, req.item_index, match_id=req.found_match_id, note=req.note)
+    if not updated:
+        raise HTTPException(status_code=404, detail="not_found")
+    return MarkFoundResponse(
+        user_id=norm,
+        item_index=req.item_index,
+        is_found=True,
+        found_at=updated.get('found_at'),
+    )

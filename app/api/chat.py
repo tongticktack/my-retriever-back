@@ -7,9 +7,8 @@ from app.services import chat_store
 from app.services.llm_providers import get_llm
 from app.services.prompt_builder import build_messages
 from app.services import extraction_controller as extc
-from app.domain import lost_item_schema as schema
 from app.services import lost_item_store
-from app.services import media_store, faiss_index, embeddings
+from app.services import media_store, faiss_index
 from config import settings
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -138,8 +137,7 @@ def send_message(req: SendMessageRequest):
     if "_img_cache" not in lost_state:
         lost_state["_img_cache"] = {}
     image_search_results = None
-    # 색상 추출 비활성화: 이미지 기반 색상 추론 제거
-    majority_image_color = None  # retained placeholder
+    # (색상 추출 기능 비활성화 상태)
     multi_image_conflict = False
     if user_meta and user_meta.get("attachments"):
         atts = user_meta.get("attachments")
@@ -265,7 +263,7 @@ def send_message(req: SendMessageRequest):
                     pass  # candidates already holds expanded set
             # If no candidates found, fall back to whole index (will be filtered by threshold later)
             candidate_set = set(candidates) if candidates else None
-            cache = lost_state.get("_img_cache") or {}
+            # simple in-memory per-session cache placeholder (현재 미사용)
             best = None
             best_score = -1.0
             atts = user_meta.get("attachments")
@@ -315,7 +313,13 @@ def send_message(req: SendMessageRequest):
     try:
         session_user = session_doc.get("user_id") if session_doc else None
         user_for_items = (req.user_id or session_user or "guest")
-        lost_item_store.bulk_upsert(user_for_items, lost_state.get("items", []))
+        # Ensure is_found flag exists (default False)
+        norm_items = []
+        for it in lost_state.get("items", []):
+            if "is_found" not in it:
+                it["is_found"] = False
+            norm_items.append(it)
+        lost_item_store.bulk_upsert(user_for_items, norm_items)
     except Exception as e:
         print(f"[lost_item_store] bulk_upsert error: {e}")
 

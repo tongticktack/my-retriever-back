@@ -169,3 +169,55 @@ python app/scripts/db_image_indexer.py
 ## 운영/로그 관리
 - 인덱싱 상세 로그(컬렉션, image_url, 통계)는 `app/scripts/db_image_indexer.py`에서 자동 기록됩니다.
 - 모든 로그는 `logs/` 폴더에 저장되며, 인덱싱 상세 로그는 `logs/image_indexing.log`에 기록됩니다.
+
+## 이메일 알림 & Firebase 설정
+
+분실물 후보 자동 알림 기능(`daily_match_notifier`)과 Firebase Auth 기반 이메일 조회를 위해 아래 환경 변수를 설정합니다.
+
+### 필수 (Firebase)
+| 변수 | 설명 |
+|------|------|
+| `FIREBASE_CREDENTIALS_JSON_STRING` | Firebase 서비스 계정 JSON 전체 문자열 |
+
+### 선택 (알림 / 스코어 / 쿨다운)
+| 변수 | 기본값 | 설명 |
+|-------|--------|------|
+| `NOTIFY_SCORE_THRESHOLD` | `0.80` | 상위 후보 점수가 이 값 이상일 때 이메일 발송 |
+| `NOTIFY_COOLDOWN_HOURS` | `24` | 동일 top 후보/유사도 기준 재알림 최소 시간 간격 |
+
+### SMTP (Plain Text Email)
+| 변수 | 기본값 | 설명 |
+|-------|--------|------|
+| `SMTP_HOST` | (없음) | SMTP 서버 호스트 (설정되지 않으면 발송 skip) |
+| `SMTP_PORT` | `587` | SMTP 포트 (STARTTLS) |
+| `SMTP_USER` | (없음) | SMTP 계정 사용자명 |
+| `SMTP_PASS` | (없음) | SMTP 계정 비밀번호 |
+| `SMTP_SENDER` | `SMTP_USER` 또는 `no-reply@example.com` | From 주소 |
+
+### 크론 설치 스크립트
+`app/scripts/install_cron.py` 실행으로 인덱싱 + 알림 작업을 멱등 설치합니다.
+
+```bash
+python -m app.scripts.install_cron \
+   --python /usr/bin/python3 \
+   --workspace /path/to/my-retriever-back \
+   --index-time 03:30 \
+   --notify-time 03:45
+```
+
+설치된 crontab 블록은 마커로 감싸져 반복 실행 시 업데이트됩니다.
+
+### 알림 메타데이터 필드
+`lost_items` 문서 내 각 item 객체에 다음 필드를 사용합니다:
+- `last_notified_at`: 마지막 이메일 발송 ISO 시각
+- `last_notified_top_id`: 마지막으로 통지한 후보 atcId
+- `last_notified_score`: 당시 점수
+
+쿨다운 시간 이내에 동일 후보라면 재발송을 건너뜁니다(점수 향상 시 정책 조정 가능).
+
+### 개선 아이디어
+- HTML 템플릿/브랜딩 적용
+- 다국어(i18n) 지원
+- 구독 해지(알림 옵트아웃) 필드 추가
+- 실패 재시도 & 메트릭(exporter) 연동
+

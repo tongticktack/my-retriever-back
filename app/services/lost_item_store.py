@@ -19,6 +19,10 @@ def upsert_lost_item(user_id: str, item_index: int, item: Dict):
     snap = ref.get()
     now = datetime.now(timezone.utc)
     # Prepare item payload
+    # Default is_found False if not present
+    is_found = item.get("is_found")
+    if is_found is None:
+        is_found = False
     item_payload = {
         "item_index": item_index,
         "stage": item.get("stage"),
@@ -26,6 +30,7 @@ def upsert_lost_item(user_id: str, item_index: int, item: Dict):
         "missing": item.get("missing") or [],
         "media_ids": item.get("media_ids") or [],
         "sources": item.get("sources") or {},
+        "is_found": is_found,
         "updated_at": now,
     }
     if not snap.exists:
@@ -87,3 +92,34 @@ def list_user_items(user_id: str, limit: int = 50, status: Optional[str] = None)
                 it[f] = str(v)
         results.append(it)
     return results
+
+
+def mark_item_found(user_id: str, item_index: int, match_id: Optional[str] = None, note: Optional[str] = None) -> Optional[Dict]:
+    db = chat_store.get_db()
+    ref = db.collection("lost_items").document(user_id)
+    snap = ref.get()
+    if not snap.exists:
+        return None
+    doc = snap.to_dict() or {}
+    items = doc.get("items") or []
+    target = None
+    for it in items:
+        if it.get("item_index") == item_index:
+            target = it
+            break
+    if not target:
+        return None
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    target["is_found"] = True
+    target["found_at"] = now
+    if match_id:
+        target["found_match_id"] = match_id
+    if note:
+        target["found_note"] = note
+    ref.update({"items": items, "updated_at": now})
+    # normalize before return
+    result = target.copy()
+    if hasattr(result.get("found_at"), 'isoformat'):
+        result["found_at"] = result["found_at"].isoformat()
+    return result
