@@ -452,6 +452,17 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
     if lost_state is None:
         lost_state = {"items": [], "active_index": None}
 
+    # 이미지만 입력된 경우 처리 (텍스트 정보 요청)
+    if image_urls and not user_text.strip():
+        reply = _persona_wrap(
+            "이미지를 확인했어요! 하지만 이미지만으로는 정확한 검색이 어려워요. "
+            "어떤 물건을 언제, 어디서 잃어버렸는지 텍스트로 알려주시면 "
+            "이미지와 함께 더 정확한 검색을 도와드릴게요. "
+            "예: '어제 성균관대에서 검정 지갑 잃어버렸어요'",
+            'ask'
+        )
+        return reply, lost_state, "image-only-prompt", None
+
     if start_new or not lost_state.get("items"):
         lost_state["items"].append({"extracted": {}, "missing": li_ext.compute_missing({}), "stage": "collecting"})
         lost_state["active_index"] = len(lost_state["items"]) - 1
@@ -502,7 +513,7 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
         elif count == 1:
             msg = (
                 "이 서비스는 분실물 회수 지원에 집중해요. 어떤 물건을 어디서 언제쯤 잃어버렸는지 알려주시면 도와드릴게요. "
-                "예: '어제 강남에서 파란 휴대폰 잃어버렸어요'"
+                "예: '어제 성균관대에서 아이폰을 잃어버렸어요'"
             )
         elif count == 2:
             msg = (

@@ -24,6 +24,8 @@ MULTI_IMAGE_MIN_INTERNAL_SIMILARITY = getattr(settings, 'MULTI_IMAGE_MIN_INTERNA
 PRIMARY_DATE_WINDOW_DAYS = getattr(settings, 'PRIMARY_DATE_WINDOW_DAYS', 14)  # 1차 윈도우 (±N일)
 EXPANDED_DATE_WINDOW_DAYS = getattr(settings, 'EXPANDED_DATE_WINDOW_DAYS', 30)  # 확장 윈도우
 STRICT_DATE_MATCH_DAYS = getattr(settings, 'STRICT_DATE_MATCH_DAYS', 3)  # 최종 matches 에 허용되는 ±일 수
+# Text search configuration
+MIN_TEXT_SEARCH_SCORE = getattr(settings, 'MIN_TEXT_SEARCH_SCORE', 0.3)  # 최소 텍스트 검색 점수 임계값
 
 def _parse_iso_date(s: str) -> Optional[date]:
     if not s:
@@ -193,7 +195,21 @@ def send_message(req: SendMessageRequest):
         )
         print(f"[chat.send] extraction_controller latency={( _t() - _t0):.2f}s model={chosen_model} reply_len={len(assistant_reply) if assistant_reply else 0}")
     # After extraction: run metadata-based candidate filtering + image similarity (lazy) if user supplied images
-    if (assistant_reply is not None) and user_meta and user_meta.get("attachments") and not multi_image_conflict:
+    # 이미지 검색은 confirmed 상태에서만 실행 (확인 후에만)
+    should_run_image_search = False
+    if user_meta and user_meta.get("attachments") and not multi_image_conflict:
+        active_idx = lost_state.get("active_index")
+        if active_idx is not None:
+            try:
+                current_item = (lost_state.get("items") or [])[active_idx]
+                current_stage = current_item.get("stage")
+                # confirmed 상태에서만 이미지 검색 실행
+                if current_stage == "confirmed":
+                    should_run_image_search = True
+            except Exception:
+                pass
+    
+    if should_run_image_search and (assistant_reply is not None):
         try:
             from app.services import faiss_index as _fi
             # Build candidate id set based on extracted info (category, region)
@@ -272,27 +288,9 @@ def send_message(req: SendMessageRequest):
             image_search_results = best
         except Exception as e:
             print(f"[chat.image_search.meta] error: {e}")
-    # After extraction reconcile image-derived color vs extracted color if mismatch
-    # 색상 reconcile 제거
-    # If controller produced reply and we have similarity results, append textual list
-    if assistant_reply and image_search_results:
-        if image_search_results:
-            lines = []
-            rank = 1
-            for iid, score, meta in image_search_results:
-                label = meta.get('media_id') if isinstance(meta, dict) else None
-                if not label:
-                    label = iid
-                extra_parts = []
-                if isinstance(meta, dict):
-                    if meta.get('category'):
-                        extra_parts.append(meta['category'])
-                    if meta.get('color'):
-                        extra_parts.append(meta['color'])
-                suffix = ("; "+", ".join(extra_parts)) if extra_parts else ""
-                lines.append(f"{rank}. {label} (score {score:.3f}{suffix})")
-                rank += 1
-            assistant_reply += f"\n\n(이미지 유사도 후보 ≥ {IMAGE_SIMILARITY_THRESHOLD:.2f})\n" + "\n".join(lines)
+    
+    # 이미지 유사도 검색 결과를 assistant reply에 포함하지 않음 (제거된 부분)
+    # 검색 결과는 matches 필드를 통해서만 전달됨
     # Acknowledge image receipt
     if user_meta and user_meta.get("attachments"):
         attachments_list = user_meta.get("attachments")
@@ -360,7 +358,7 @@ def send_message(req: SendMessageRequest):
     user_attachments = None
     if user_meta and user_meta.get("attachments"):
         user_attachments = user_meta.get("attachments")
-    # Build matches list (external, then internal text-fallback)
+    # Build matches list (external, then internal text-fallback with image re-ranking)
     matches = None
     try:
         active_idx = lost_state.get("active_index")
@@ -381,13 +379,31 @@ def send_message(req: SendMessageRequest):
                         'score': m.get('score'),
                     })
                 matches = trimmed
-        if matches is None and not (user_meta and user_meta.get("attachments")):
+        
+        # Internal text search - 이미지 여부와 상관없이 텍스트 기반 검색 먼저 수행
+        if matches is None:
             extracted = active_item.get("extracted") if active_item else None
-            if extracted and (extracted.get("category") or extracted.get("region")):
+            # 개선: category나 region이 있거나, 이미지가 있는 경우에만 검색 실행
+            # lost_date만 있고 이미지가 없으면 검색하지 않음 (의미없는 검색 방지)
+            has_images = user_meta and user_meta.get("attachments")
+            has_meaningful_text = extracted and (extracted.get("category") or extracted.get("region"))
+            
+            if extracted and (has_meaningful_text or has_images):
                 from app.services import faiss_index as _fi
+                from app.services.synonym_mapper import (
+                    expand_category_terms, is_category_match, 
+                    calculate_similarity_score, expand_search_terms_with_subcategory,
+                    calculate_category_subcategory_score
+                )
+                
                 cat_q = (extracted.get("category") or "").lower().strip()
+                sub_q = (extracted.get("subcategory") or "").lower().strip() 
                 region_q = (extracted.get("region") or "").lower().strip()
                 lost_date = _parse_iso_date(extracted.get("lost_date")) if extracted.get("lost_date") else None
+                
+                # 개선된 카테고리 + 서브카테고리 검색어 확장
+                expanded_categories, target_subcategories = expand_search_terms_with_subcategory(cat_q, sub_q)
+                
                 candidates = []
                 primary = []
                 expanded = []
@@ -396,15 +412,37 @@ def send_message(req: SendMessageRequest):
                         continue
                     if meta.get("type") in {"media","lost_item"}:
                         continue
-                    mcat = str(meta.get("category") or "").lower()
-                    if cat_q and cat_q not in mcat:
+                    
+                    # 개선된 카테고리 매칭 (서브카테고리 고려)
+                    category_match = False
+                    if cat_q or sub_q:
+                        mcat = str(meta.get("category") or "").lower()
+                        
+                        # 기본 카테고리 매칭
+                        if cat_q:
+                            category_match = is_category_match(mcat, [cat_q])
+                        
+                        # 서브카테고리를 고려한 추가 매칭
+                        if not category_match and sub_q:
+                            # 서브카테고리만 있는 경우에도 매칭 시도
+                            category_match = is_category_match(mcat, expanded_categories)
+                    else:
+                        category_match = True  # 카테고리 조건 없으면 통과
+                    
+                    if not category_match:
                         continue
-                    mplace = str(meta.get("found_place") or "").lower()
-                    region_ok = True
+                    
+                    # 간단한 지역 매칭 (동의어 없이 정확한 부분 매칭)
+                    region_match = False
                     if region_q:
-                        region_ok = (region_q in mplace)
-                    if not region_ok:
+                        mplace = str(meta.get("found_place") or "").lower()
+                        region_match = region_q in mplace
+                    else:
+                        region_match = True  # 지역 조건 없으면 통과
+                    
+                    if not region_match:
                         continue
+                    
                     # Date handling
                     found_raw = meta.get('found_time') or meta.get('foundDate') or meta.get('found_date')
                     found_d = _parse_iso_date(found_raw) if isinstance(found_raw, str) else None
@@ -415,40 +453,68 @@ def send_message(req: SendMessageRequest):
                             in_primary = True
                         elif _within_window(found_d, lost_date, EXPANDED_DATE_WINDOW_DAYS):
                             in_expanded = True
+                    
+                    # 개선된 스코어링 시스템 (서브카테고리 고려)
                     score = 0.0
-                    if cat_q:
-                        score += 0.55
-                    if region_q and region_ok:
-                        score += 0.25
-                    # Date score (only when both dates present)
+                    
+                    # 카테고리 + 서브카테고리 점수 (최대 0.65)
+                    if cat_q or sub_q:
+                        mcat = str(meta.get("category") or "")
+                        cat_sub_score = calculate_category_subcategory_score(mcat, cat_q, sub_q)
+                        score += cat_sub_score * 0.65
+                    
+                    # 지역 점수 (정확 매칭만, 최대 0.20)
+                    if region_q:
+                        mplace = str(meta.get("found_place") or "")
+                        if region_q in mplace.lower():
+                            score += 0.20
+                    
+                    # Date score (only when both dates present) - 최대 0.15
                     if lost_date and found_d:
                         delta_days = abs((found_d - lost_date).days)
                         max_window = PRIMARY_DATE_WINDOW_DAYS if delta_days <= PRIMARY_DATE_WINDOW_DAYS else EXPANDED_DATE_WINDOW_DAYS
                         date_score = max(0.0, 1 - delta_days / max_window)
-                        score += date_score * 0.20
+                        score += date_score * 0.15
                     elif lost_date and not found_d:
-                        score += 0.08  # partial credit for unknown date
+                        score += 0.05  # partial credit for unknown date
+                    elif not lost_date:
+                        score += 0.10  # 날짜 조건 없으면 기본 점수
+                    
+                    # 최소 스코어 임계값 적용
+                    if score < MIN_TEXT_SEARCH_SCORE:
+                        continue
+                    
                     entry = (iid, score, meta, in_primary, in_expanded)
                     candidates.append(entry)
                     if in_primary:
                         primary.append(entry)
                     elif in_expanded:
                         expanded.append(entry)
+                        
                 def _ts(meta):
                     return meta.get('created_at') or meta.get('createdAt') or ''
+                
+                # 개선된 결과 선택 로직 (날짜 윈도우 혼합)
                 ranked_source = []
                 if lost_date:
                     if primary:
                         ranked_source.extend(primary)
+                        # primary가 적으면 expanded에서 고득점 결과도 포함
+                        if len(primary) < 10:
+                            high_score_expanded = [e for e in expanded if e[1] >= 0.7]
+                            ranked_source.extend(high_score_expanded[:5])
                     elif expanded:
                         ranked_source.extend(expanded)
                     else:
-                        ranked_source.extend(candidates)
+                        # 날짜 윈도우에 없어도 고득점이면 포함
+                        high_score_all = [e for e in candidates if e[1] >= 0.8]
+                        ranked_source.extend(high_score_all)
                 else:
                     ranked_source = candidates
+                    
                 ranked_source.sort(key=lambda x: (x[1], _ts(x[2])), reverse=True)
                 trimmed = []
-                for iid, score, meta, *_rest in ranked_source[:10]:
+                for iid, score, meta, *_rest in ranked_source[:20]:  # 더 많이 가져와서 이미지 재랭킹 대상 확보
                     trimmed.append({
                         'atcId': meta.get('atcId') or meta.get('id') or iid,
                         'collection': 'internal-text',
@@ -456,52 +522,52 @@ def send_message(req: SendMessageRequest):
                         'itemName': meta.get('caption') or meta.get('notes') or meta.get('category'),
                         'foundDate': meta.get('found_time'),
                         'storagePlace': meta.get('found_place'),
-                        'imageUrl': None,
+                        'imageUrl': meta.get('url') or meta.get('imageUrl') or meta.get('image_url'),
                         'score': round(score, 3),
+                        'meta_ref': meta  # 이미지 재랭킹을 위한 메타 참조 추가
                     })
                 if trimmed:
                     matches = trimmed
     except Exception as e:
         print(f"[chat.send] matches build error: {e}")
 
-    # Do NOT merge image similarity into matches (rollback behavior)
-
-    # Removed: proxy link markdown injection (요청에 따라 링크 제공 X)
-
-    # Merge image similarity candidates into matches with source tag
+    # 이미지 기반 재랭킹 (confirmed 상태에서 이미지가 있는 경우)
     try:
-        if image_search_results:
-            img_items = []
+        if image_search_results and matches and user_meta and user_meta.get("attachments"):
+            # 이미지 유사도 스코어 맵 생성
+            image_scores = {}
             for iid, score, meta in image_search_results:
-                if not isinstance(meta, dict):
-                    continue
                 atc_id = meta.get('atcId') or meta.get('atc_id') or meta.get('id') or iid
-                img_items.append({
-                    'atcId': atc_id,
-                    'collection': 'internal-image',
-                    'itemCategory': meta.get('category'),
-                    'itemName': meta.get('caption') or meta.get('notes') or meta.get('category'),
-                    'foundDate': meta.get('found_time') or meta.get('foundDate') or meta.get('found_date'),
-                    'storagePlace': meta.get('found_place'),
-                    'imageUrl': meta.get('url') or meta.get('imageUrl') or meta.get('image_url'),
-                    'score': round(float(score), 4),
-                    'source': 'image'
-                })
-            if img_items:
-                if matches:
-                    seen = set()
-                    merged = []
-                    for it in img_items + matches:
-                        aid = it.get('atcId')
-                        if aid in seen:
-                            continue
-                        seen.add(aid)
-                        merged.append(it)
-                    matches = merged
+                image_scores[atc_id] = score
+
+            # 텍스트 기반 matches에 이미지 유사도 스코어 적용하여 재랭킹
+            for match in matches:
+                atc_id = match.get('atcId')
+                if atc_id in image_scores:
+                    text_score = match.get('score', 0)
+                    image_score = image_scores[atc_id]
+                    # 가중치: 텍스트 0.4, 이미지 0.6으로 재랭킹
+                    combined_score = (text_score * 0.4) + (image_score * 0.6)
+                    match['score'] = round(combined_score, 4)
+                    match['source'] = 'text+image'
+                    match['image_score'] = round(image_score, 4)
                 else:
-                    matches = img_items
+                    # 이미지 유사도가 없는 경우 패널티 적용
+                    match['score'] = match.get('score', 0) * 0.3
+                    match['source'] = 'text-only'
+            
+            # 재랭킹된 결과 정렬 후 상위 10개만 유지
+            matches.sort(key=lambda x: x.get('score', 0), reverse=True)
+            matches = matches[:10]
+
+            # meta_ref 제거 (응답에서 불필요)
+            for match in matches:
+                match.pop('meta_ref', None)
+
     except Exception as e:
-        print(f"[chat.send] image->matches merge error: {e}")
+        print(f"[chat.send] image re-ranking error: {e}")
+
+    # Do NOT merge raw image similarity into matches (이제 재랭킹으로 처리)
 
     # Strict date filtering for matches (±STRICT_DATE_MATCH_DAYS) if user provided lost_date
     try:
