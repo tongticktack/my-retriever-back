@@ -20,8 +20,8 @@ except Exception as e:
 
 router = APIRouter(prefix="/media", tags=["media"])
 
-ALLOWED_CONTENT_TYPES = {"image/jpeg": ".jpg", "image/png": ".png"}
-MAX_BYTES = 5 * 1024 * 1024  # 5MB
+ALLOWED_CONTENT_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/jpeg": ".jpeg", "image/webp": ".webp"}
+MAX_BYTES = 10 * 1024 * 1024  # 10MB
 
 
 class MediaUploadResponse(BaseModel):
