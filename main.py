@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request
 from firebase_admin import credentials
 
 from config import settings
-from logging_config import setup_logging, get_logger, set_request_id
+from app.scripts.logging_config import setup_logging, get_logger, set_request_id
 
 # 1) 로깅 설정(최우선)
 # 운영 환경에서 JSON 로그를 원하면 json_fmt=True
