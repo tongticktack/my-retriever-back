@@ -104,19 +104,18 @@ async def log_requests(request: Request, call_next):
 # 5) CORS (optional)
 try:
     from fastapi.middleware.cors import CORSMiddleware
-    allowed_origins = [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "https://localhost:3000",
-    ]
+    # Allow ALL origins. Note: when allow_credentials=True, cannot use wildcard list so use regex.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=allowed_origins,
+        allow_origins=[],            # empty list; we rely on regex below
+        allow_origin_regex=".*",    # match any origin
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["*"],       # optional: expose all if needed
+        max_age=86400,
     )
-    logger.info("CORS middleware configured for %s", allowed_origins)
+    logger.warning("CORS middleware configured to allow ALL origins (allow_origin_regex=.*)")
 except Exception as e:
     logger.warning("CORS middleware not added: %s", e)
 

@@ -16,6 +16,7 @@ import numpy as np
 
 from config import settings
 from . import embeddings
+from app.scripts.logging_config import get_logger
 
 # ------------------------------------------------------------------------------------
 # 경로/전역 상태
@@ -35,6 +36,7 @@ IDMAP_IMAGE: List[str] = []  # position -> item_id
 # 구성값
 EMBED_DIM_IMAGE: int = int(getattr(settings, "EMBEDDING_DIM_IMAGE", embeddings.dims()))
 EMBEDDING_VERSION: str = getattr(settings, "EMBEDDING_VERSION", "v1")
+logger = get_logger("faiss")
 
 
 # ------------------------------------------------------------------------------------
@@ -151,8 +153,10 @@ def add_item(item_id: str, image_vec, text_vec, meta: dict) -> None:
 
             if IMAGE_INDEX is None:
                 raise RuntimeError("IMAGE_INDEX가 초기화되지 않았습니다. load_all()을 호출했나요?")
+            before = IMAGE_INDEX.ntotal
             IMAGE_INDEX.add(arr)
             IDMAP_IMAGE.append(item_id)
+            logger.info("faiss_add item=%s dim=%d ntotal_before=%d ntotal_after=%d", item_id, d, before, IMAGE_INDEX.ntotal)
 
         META[item_id] = meta
 
@@ -172,8 +176,10 @@ def search_image(query_vec, k: int = 5) -> List[Tuple[str, float, dict]]:
         ntotal = IMAGE_INDEX.ntotal
         k = max(1, min(int(k), ntotal))
 
-        scores, idxs = IMAGE_INDEX.search(q, k)
+    scores, idxs = IMAGE_INDEX.search(q, k)
+    logger.info("faiss_search k=%d ntotal=%d returned=%d", k, ntotal, len(idxs[0]))
         out: List[Tuple[str, float, dict]] = []
+        rank = 0
         for score, idx in zip(scores[0], idxs[0]):
             if idx == -1:
                 continue
@@ -183,6 +189,8 @@ def search_image(query_vec, k: int = 5) -> List[Tuple[str, float, dict]]:
             item_id = IDMAP_IMAGE[idx]
             meta = META.get(item_id, {})
             out.append((item_id, float(score), meta))
+            logger.info("faiss_hit rank=%d item=%s score=%.4f", rank, item_id, float(score))
+            rank += 1
         return out
 
 

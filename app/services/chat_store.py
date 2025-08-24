@@ -3,6 +3,9 @@ from datetime import datetime, timezone
 import uuid
 
 from firebase_admin import firestore
+from app.scripts.logging_config import get_logger
+
+logger = get_logger("chat_store")
 
 _db = None
 
@@ -35,7 +38,7 @@ def create_session(user_id: Optional[str] = None) -> str:
     "title": None,  # 첫 user 메시지 들어올 때 생성
     })
     try:
-        print(f"[chat_store] create_session id={session_id} user_id={norm_user_id}")
+        logger.info("create_session id=%s user_id=%s", session_id, norm_user_id)
     except Exception:
         pass
     return session_id
@@ -165,17 +168,17 @@ def list_sessions(user_id: str, limit: int = 50) -> List[Dict]:
     # 최신 SDK 는 positional where 경고를 표시하므로 FieldFilter 사용. 실패 시 이전 방식 fallback.
     col = db.collection("chat_sessions")
     try:
-        print(f"[chat_store] list_sessions.start user_id={user_id} limit={limit}")
+        logger.debug("list_sessions.start user_id=%s limit=%s", user_id, limit)
     except Exception:
         pass
     # Simplified strategy: avoid order_by to remove composite index requirement (was hanging / requiring index).
     # We'll fetch up to 3x limit docs (user typically has few sessions) then sort in memory.
     try:
         from google.cloud.firestore_v1 import FieldFilter  # type: ignore
-        base_query = col.where(filter=FieldFilter("user_id", "==", user_id))
-        print("[chat_store] query.base FieldFilter")
+    base_query = col.where(filter=FieldFilter("user_id", "==", user_id))
+    logger.debug("query.base FieldFilter")
     except Exception as e:
-        print(f"[chat_store] FieldFilter unavailable, positional where used ({type(e).__name__}: {e})")
+        logger.warning("FieldFilter unavailable fallback type=%s msg=%s", type(e).__name__, e)
         base_query = col.where("user_id", "==", user_id)
     sessions: List[Dict] = []
     from google.api_core import exceptions as _gexc  # type: ignore
@@ -188,10 +191,10 @@ def list_sessions(user_id: str, limit: int = 50) -> List[Dict]:
             probe_iter = base_query.limit(1).stream()
             probe_first = list(probe_iter)
             if not probe_first:
-                print("[chat_store] probe.empty user has no sessions")
+                logger.info("probe.empty user=%s", user_id)
                 return []
         except Exception as pe:
-            print(f"[chat_store] probe error {type(pe).__name__}: {pe}")
+            logger.error("probe error type=%s msg=%s", type(pe).__name__, pe)
         # Drain with watchdog thread to avoid indefinite hang on network issues
         import threading as _th
         docs_buffer: List = []
@@ -208,9 +211,9 @@ def list_sessions(user_id: str, limit: int = 50) -> List[Dict]:
         th.start()
         th.join(2.5)
         if th.is_alive():
-            print(f"[chat_store] watchdog timeout partial_docs={len(docs_buffer)}")
+            logger.warning("watchdog timeout partial_docs=%d", len(docs_buffer))
         if exc_holder:
-            print(f"[chat_store] list_sessions drain error {type(exc_holder[0]).__name__}: {exc_holder[0]}")
+            logger.error("list_sessions drain error type=%s msg=%s", type(exc_holder[0]).__name__, exc_holder[0])
         # In-memory sort DESC by last_active_at
         def _extract_times(d):
             data = d.to_dict() or {}
@@ -242,7 +245,7 @@ def list_sessions(user_id: str, limit: int = 50) -> List[Dict]:
             })
     except _gexc.FailedPrecondition as e:
         # Likely missing composite index (user_id + last_active_at). Fallback: simple where only.
-        print(f"[chat_store] primary query requires index (fallback). detail={e.message[:140] if hasattr(e,'message') else e}")
+    logger.warning("primary query requires index fallback detail=%s", e.message[:140] if hasattr(e,'message') else e)
         try:
             simple_q = col.where("user_id", "==", user_id).limit(limit)
             for doc in simple_q.stream():
@@ -264,12 +267,12 @@ def list_sessions(user_id: str, limit: int = 50) -> List[Dict]:
                     "last_active_at": last_str,
                 })
         except Exception as e2:
-            print(f"[chat_store] fallback simple query failed {e2}")
+            logger.error("fallback simple query failed err=%s", e2)
     except Exception as e:
-        print(f"[chat_store] session list unexpected error {type(e).__name__}: {e}")
+        logger.error("session list unexpected error type=%s msg=%s", type(e).__name__, e)
     finally:
         try:
-            print(f"[chat_store] list_sessions.end user_id={user_id} count={len(sessions)} elapsed={(_time.time()-t0):.2f}s")
+            logger.debug("list_sessions.end user_id=%s count=%d elapsed=%.2fs", user_id, len(sessions), (_time.time()-t0))
         except Exception:
             pass
     return sessions

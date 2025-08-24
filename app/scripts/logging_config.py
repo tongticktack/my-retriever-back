@@ -74,6 +74,17 @@ def build_dict_config(json_fmt: bool = False) -> dict:
                 "backupCount": 30,
                 "encoding": "utf-8",
             },
+            "file_user_image_embedding": {
+                "class": "logging.handlers.TimedRotatingFileHandler",
+                "level": "INFO",
+                "formatter": "default",
+                "filters": ["request_id"],
+                "filename": str(LOG_DIR / "user_image_embedding.log"),
+                "when": "midnight",
+                "interval": 1,
+                "backupCount": 30,
+                "encoding": "utf-8",
+            },
         },
         "loggers": {
             # 루트 로거: 앱 전반
@@ -85,6 +96,12 @@ def build_dict_config(json_fmt: bool = False) -> dict:
             "image_indexing": {
                 "level": "INFO",
                 "handlers": ["console", "file_image_indexing"],
+                "propagate": False,
+            },
+            # 사용자 업로드 이미지 임베딩 전용 로거
+            "media_embed": {
+                "level": "INFO",
+                "handlers": ["console", "file_user_image_embedding"],
                 "propagate": False,
             },
             # uvicorn 로거 레벨 통일

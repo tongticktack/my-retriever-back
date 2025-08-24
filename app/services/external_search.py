@@ -45,6 +45,9 @@ import re
 
 from app.domain import lost_item_schema as schema
 from . import chat_store  # reuse firestore client
+from app.scripts.logging_config import get_logger
+
+logger = get_logger("external_search")
 
 COLLECTIONS = ["PoliceLostItem", "PortalLostItem"]
 
@@ -136,7 +139,7 @@ def _query_candidates(collection: str, extracted: Dict) -> List[Dict]:
                             d['collection'] = collection
                             docs[snap.id] = d
                 except Exception as e:
-                    print(f"[external_search] date_window_query_error {collection} day={day}: {e}")
+                    logger.error("date_window_query_error collection=%s day=%s err=%s", collection, day, e)
     return list(docs.values())
 
 def approximate_external_matches(extracted: Dict, place_query: str | None = None, max_results: int = 10) -> List[Dict]:
@@ -149,29 +152,18 @@ def approximate_external_matches(extracted: Dict, place_query: str | None = None
     if place_query:
         pq_norm = str(place_query).strip().lower()
         place_query = pq_norm if len(pq_norm) >= 2 else None
-    try:
-        print(
-            "[external_search] start category=%s sub=%s date=%s place_query=%s max=%s" % (
-                extracted.get('category'),
-                extracted.get('subcategory'),
-                extracted.get('lost_date'),
-                place_query,
-                max_results,
-            )
-        )
-    except Exception:
-        pass
+    logger.info("start category=%s sub=%s date=%s place_query=%s max=%s", extracted.get('category'), extracted.get('subcategory'), extracted.get('lost_date'), place_query, max_results)
     all_docs: List[Dict] = []
     for coll in COLLECTIONS:
         before = len(all_docs)
         try:
             cand = _query_candidates(coll, extracted)
         except Exception as e:
-            print(f"[external_search] collection_error {coll}: {e}")
+            logger.error("collection_error collection=%s err=%s", coll, e)
             cand = []
         all_docs.extend(cand)
         added = len(all_docs) - before
-        print(f"[external_search] collected collection={coll} added={added} total={len(all_docs)}")
+    logger.debug("collected collection=%s added=%d total=%d", coll, added, len(all_docs))
     # place_query filtering (hard filter first, fallback if empty)
     filtered = all_docs
     place_filtered = False
@@ -194,25 +186,12 @@ def approximate_external_matches(extracted: Dict, place_query: str | None = None
         scored.append((s, d_copy))
     scored.sort(key=lambda x: x[0], reverse=True)
     if not scored:
-        print(f"[external_search] no_scored_matches category={extracted.get('category')} sub={extracted.get('subcategory')} date={extracted.get('lost_date')} place_query={place_query}")
+        logger.info("no_scored_matches category=%s sub=%s date=%s place_query=%s", extracted.get('category'), extracted.get('subcategory'), extracted.get('lost_date'), place_query)
     else:
         top_ids = [d['atcId'] for _, d in scored[:max_results]]
-        print(f"[external_search] scored_matches count={len(scored)} top={top_ids} place_filtered={place_filtered} fallback_place={fallback_place}")
-        # Detail component breakdown for top few
+        logger.info("scored_matches count=%d top=%s place_filtered=%s fallback_place=%s", len(scored), top_ids, place_filtered, fallback_place)
         for _, dd in scored[: min(5, len(scored))]:
-            try:
-                print(
-                    "[external_search] detail atcId=%s score=%.2f comp=%s cat=%s foundDate=%s place_hit=%s" % (
-                        dd.get('atcId'),
-                        dd.get('score'),
-                        dd.get('components'),
-                        dd.get('itemCategory'),
-                        dd.get('foundDate'),
-                        'place' in (dd.get('components') or {}),
-                    )
-                )
-            except Exception:
-                pass
+            logger.debug("detail atcId=%s score=%.2f comp=%s cat=%s foundDate=%s place_hit=%s", dd.get('atcId'), dd.get('score'), dd.get('components'), dd.get('itemCategory'), dd.get('foundDate'), 'place' in (dd.get('components') or {}))
     return [d for _, d in scored[:max_results]]
 
 def summarize_matches(matches: List[Dict], limit: int = 3) -> str:

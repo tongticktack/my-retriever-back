@@ -9,6 +9,7 @@ from PIL import Image
 from firebase_admin import storage, firestore
 from . import chat_store
 from . import embeddings, faiss_index
+from app.scripts.logging_config import get_logger
 from config import settings
 
 # Firestore collection name
@@ -67,6 +68,9 @@ def _palette(data: bytes, k: int = 3) -> List[str]:
     return hexes
 
 
+logger = get_logger("media_embed")
+
+
 def upload_image(data: bytes, content_type: str) -> Dict[str, Any]:
     ph = _phash(data)
     db = chat_store.get_db()
@@ -89,14 +93,15 @@ def upload_image(data: bytes, content_type: str) -> Dict[str, Any]:
         url = blob.path
     pal = _palette(data)
     # compute embedding (hash or provider) and normalize (embeddings handles it)
+    emb_list = None
+    image_vec = None
+    t0 = time.time()
     try:
         image_vec = embeddings.embed_image(data)
-        # store as list for now (small ~dim numbers)
         emb_list = image_vec.tolist()
+        logger.info("user_image_embedding success mid=pending dim=%d ms=%.1f", len(emb_list), (time.time()-t0)*1000)
     except Exception as e:
-        print("[media_store] embed_image error", e)
-        image_vec = None
-        emb_list = None
+        logger.error("user_image_embedding error mid=pending err=%s", e)
     # width/height
     try:
         im = Image.open(io.BytesIO(data))
@@ -118,6 +123,11 @@ def upload_image(data: bytes, content_type: str) -> Dict[str, Any]:
         'embedding': emb_list,
     }
     db.collection(MEDIA_COLLECTION).document(mid).set(meta)
+    # Post-write log (now we know final mid)
+    if emb_list is not None:
+        logger.info("user_image_stored mid=%s hash=%s dim=%d palette=%s", mid, ph, len(emb_list), ','.join(pal))
+    else:
+        logger.warning("user_image_stored_no_embedding mid=%s hash=%s", mid, ph)
     return meta
 
 

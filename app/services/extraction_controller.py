@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from app.services import lost_item_extractor as li_ext
+from app.scripts.logging_config import get_logger
 from app.domain import lost_item_schema as schema
 from app.services.llm_providers import get_llm
 from app.services import external_search
@@ -184,12 +185,14 @@ def _load_multimodal_prompt() -> str:
     return ""
 
 
+logger = get_logger("extract")
+
 def _strict_llm_extract(user_text: str, current: Dict[str, str], image_urls: Optional[List[str]] = None) -> Dict[str, Any]:  # pragma: no cover (LLM)
     """LLM JSON-only structured extraction using external prompt file with retry & light repair."""
     llm = get_llm()
     # debug: record provider + model for diagnostics
     try:
-        print(f"[extract.llm] provider={getattr(llm,'name',None)} model={getattr(llm,'model',None)} text_len={len(user_text)} images={len(image_urls) if image_urls else 0}")
+        logger.info("llm.provider model=%s provider=%s text_len=%d images=%d", getattr(llm,'model',None), getattr(llm,'name',None), len(user_text), len(image_urls) if image_urls else 0)
     except Exception:
         pass
     today = datetime.now().date().isoformat()
@@ -368,7 +371,7 @@ def _strict_llm_extract(user_text: str, current: Dict[str, str], image_urls: Opt
                     if 'confidences' in cleaned and 'lost_date' in cleaned['confidences']:
                         cleaned['confidences'].pop('lost_date', None)
             if orig != cleaned.get('lost_date'):
-                print(f"[extract.llm] normalize_date raw={orig} -> {cleaned.get('lost_date')}")
+                logger.debug("normalize_date raw=%s -> %s", orig, cleaned.get('lost_date'))
         return cleaned
 
     raw = ""
@@ -376,9 +379,9 @@ def _strict_llm_extract(user_text: str, current: Dict[str, str], image_urls: Opt
         try:
             raw = llm.generate(messages).strip()
             if not raw:
-                print(f"[extract.llm] empty_output attempt={attempt}")
+                logger.warning("empty_output attempt=%d", attempt)
         except Exception:
-            print(f"[extract.llm] exception attempt={attempt}")
+            logger.error("llm_generate_exception attempt=%d", attempt)
             return {}
         parsed = _attempt_parse(raw)
         if parsed is not None:
@@ -386,7 +389,7 @@ def _strict_llm_extract(user_text: str, current: Dict[str, str], image_urls: Opt
         # repair hint for retry: force user to output ONLY JSON
         messages.append({"role": "user", "content": "JSON 형식 오류. 순수 JSON 객체만 다시 출력."})
     # final debug
-    print(f"[extract.llm] parse_failed snippet={raw[:120]!r}")
+    logger.error("parse_failed snippet=%s", raw[:120])
     return {}
 
 
@@ -452,16 +455,14 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
     if lost_state is None:
         lost_state = {"items": [], "active_index": None}
 
-    # 이미지만 입력된 경우 처리 (텍스트 정보 요청)
+    # NOTE: image-only 메시지를 stage/context 기반으로 다르게 처리
+    # (1) 아직 활성 아이템이 없으면 아래에서 새 아이템 생성 후 collecting 흐름에서 안내
+    # (2) 이미 collecting 단계라면 정보 요청 프롬프트
+    # (3) ready/confirmed 단계라면 재요청 없이 간단 확인 멘트
+    image_only_deferred = False  # ready 판단 후 처리 위해 플래그
     if image_urls and not user_text.strip():
-        reply = _persona_wrap(
-            "이미지를 확인했어요! 하지만 이미지만으로는 정확한 검색이 어려워요. "
-            "어떤 물건을 언제, 어디서 잃어버렸는지 텍스트로 알려주시면 "
-            "이미지와 함께 더 정확한 검색을 도와드릴게요. "
-            "예: '어제 성균관대에서 검정 지갑 잃어버렸어요'",
-            'ask'
-        )
-        return reply, lost_state, "image-only-prompt", None
+        # active item 여부 / stage 확인은 아이템 확보 후 수행 (조금 뒤)
+        image_only_deferred = True
 
     if start_new or not lost_state.get("items"):
         lost_state["items"].append({"extracted": {}, "missing": li_ext.compute_missing({}), "stage": "collecting"})
@@ -472,6 +473,27 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
         return None, lost_state, "lost-item-flow.v2", None
     current = lost_state["items"][idx]
     user_lower = user_text.strip().lower()
+
+    # image-only (deferred) 처리: stage/context 기반 응답 결정
+    if image_only_deferred:
+        stage = current.get("stage")
+        extracted = current.get("extracted", {})
+        # 핵심 필드 최소 한 개라도 확보 여부 (category/region/lost_date 중)
+        has_core = any(extracted.get(k) for k in ["category", "region", "lost_date"]) or stage in {"ready", "confirmed"}
+        if not has_core:
+            reply = _persona_wrap(
+                "이미지를 확인했어요! 하지만 이미지만으로는 정확한 검색이 어려워요. "
+                "어떤 물건을 언제, 어디서 잃어버렸는지 텍스트로 알려주시면 "
+                "이미지와 함께 더 정확한 검색을 도와드릴게요. "
+                "예: '어제 성균관대에서 검정 지갑 잃어버렸어요'",
+                'ask'
+            )
+            return reply, lost_state, "image-only-prompt", _snapshot(idx, current)
+        else:
+            # 이미 핵심 정보 존재 → 간단 확인 멘트 (stage 유지)
+            tone = 'confirm' if stage == 'ready' else 'ask'
+            msg = "이미지 잘 받았어요. 기존 분실물 정보에 사진을 추가해 두었습니다. 필요한 수정이 있으면 말씀해 주세요. 진행 원하시면 '확인'이라고 해주시면 돼요."
+            return _persona_wrap(msg, tone), lost_state, "image-ack", _snapshot(idx, current)
 
     # Intent detection BEFORE extraction (greeting/policy may bypass item flow)
     intent, intent_source = classify_intent(user_text)
@@ -487,6 +509,55 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
     if lost_state.get("soft_lock") and intent == 'greeting':
         lost_state.pop("soft_lock", None)
 
+    # Ready-stage filler/image handling: 사용자가 이미 필수 정보를 준 뒤 이미지만 추가하거나 짧은 추임새("여깄어", "응", "ㅇㅋ")를 보낸 경우 off-topic 로 간주하지 않고 확인 요약 재표시
+    if current.get("stage") == "ready" and intent == "other":
+        filler_tokens = {"여깄어","여기야","응","ㅇㅇ","ㅇㅋ","오케이","좋아","넵","넹","확인","됐어","됐습니다","추가","사진","이미지"}
+        norm = user_text.strip().lower()
+        # 한글 자모 제거 간단화
+        if (not user_text.strip()) or (len(norm) <= 6 and any(tok in norm for tok in filler_tokens)) or image_urls:
+            # 재확인 요약 재전송 (stage 유지)
+            confirmation = _build_confirmation_summary(current.get("extracted", {}))
+            reply = _persona_wrap(confirmation + "\n(이미지/추임새 입력으로 정보를 변경하지 않았어요. 괜찮으면 계속 진행 의사를 자연스럽게 표현하거나 '확인'이라 해 주세요.)", 'confirm')
+            snapshot = _snapshot(idx, current)
+            if ENABLE_STYLE_ENRICH:
+                enriched = _style_enrich(reply, intent="item", item_snapshot=snapshot)
+                if enriched:
+                    reply = enriched
+            if ENABLE_RESPONSE_GUARD:
+                guarded = _guard_response(reply, intent="item", model_label="lost-item-flow.v2", item_snapshot=snapshot)
+                if guarded:
+                    reply = guarded
+            return reply, lost_state, "lost-item-flow.v2", snapshot
+
+    # 간단 확정 자연어 (확인, 맞아요 등) -> confirm 으로 승격
+    if current.get("stage") == "ready" and intent == "other":
+        low = user_text.strip().lower()
+        confirm_syns = ["확인", "맞아", "맞아요", "맞습니다", "그래", "그렇다", "ok", "okay", "오케이", "좋아", "좋습니다"]
+        if any(s in low for s in confirm_syns) and 2 <= len(low) <= 15:
+            intent = 'confirm'
+
+    # 잘못된 confirm 오탐 방어: 사진 추가/업로드 문의는 confirm 아님
+    if current.get("stage") == "ready" and intent == 'confirm':
+        low = user_text.strip().lower()
+        # 물음표 포함 + 사진 관련 동사/명사 존재 -> confirm 취소
+        photo_words = ["사진","이미지","첨부","추가","올려","업로드"]
+        if ("?" in low or "?" in user_text) and any(w in low for w in photo_words):
+            # intent 를 other 로 강등하고 안내 처리 (filler 분기 재사용)
+            intent = 'other'
+            confirmation = _build_confirmation_summary(current.get("extracted", {}))
+            advise = "\n사진은 최대 3장까지 바로 올리셔도 돼요. 이미 확정 전 단계이니 사진을 추가하거나 '확인'이라고 말씀주시면 검색을 진행할게요."
+            reply = _persona_wrap(confirmation + advise, 'confirm')
+            snapshot = _snapshot(idx, current)
+            if ENABLE_STYLE_ENRICH:
+                enriched = _style_enrich(reply, intent="item", item_snapshot=snapshot)
+                if enriched:
+                    reply = enriched
+            if ENABLE_RESPONSE_GUARD:
+                guarded = _guard_response(reply, intent="item", model_label="lost-item-flow.v2", item_snapshot=snapshot)
+                if guarded:
+                    reply = guarded
+            return reply, lost_state, "lost-item-flow.v2", snapshot
+
     if intent in {"greeting", "policy", "other"}:
         if intent == "greeting":
             # Pass through: allow general LLM (system prompt) to craft intro instead of fixed template
@@ -498,26 +569,26 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
                 "물건 정보를 알려주시면 바로 구조화해서 검색 준비를 도와드릴게요."
             )
             return _persona_wrap(reply, 'ask'), lost_state, "intent:policy", _snapshot(idx, current)
-        # other (off-topic): block general chat & gently/firmly redirect
+        # other (off-topic or filler): allow LIMITED free-form LLM on first benign occurrence
         lowered = user_text.lower()
         keyword_hit = next((kw for kw in OFF_TOPIC_KEYWORDS if kw in lowered), None)
         count = lost_state.get("off_topic_count", 0) + 1
         lost_state["off_topic_count"] = count
+        # Hard redirect / lock path first
         if count > SOFT_LOCK_THRESHOLD:
             lost_state["soft_lock"] = True
             _log_metric('intent.soft_lock', count=count)
             msg = "분실물 정보 없이 다른 주제 대화가 계속되어 잠시 잠금 상태입니다. 예: '어제 강남에서 검정 백팩 잃어버렸어요' 처럼 알려주시면 다시 도와드릴게요."
             return _persona_wrap(msg, 'ask'), lost_state, "intent:redirect-lock", _snapshot(idx, current)
+        # First occurrence & no strong off-topic keyword -> pass-through to general LLM (persona prompt) with guidance flag
+        if count == 1 and not keyword_hit:
+            lost_state["other_llm_redirect"] = True  # prompt_builder will inject guidance system message
+            return None, lost_state, "intent:other-pass", _snapshot(idx, current)
+        # Subsequent occurrences or keyword hit -> templated redirect (still persona wrapped)
         if keyword_hit:
             msg = f"해당 주제(예: {keyword_hit})는 이 서비스 범위를 벗어나요. 분실한 물건의 종류와 장소, 날짜 중 하나라도 알려주시면 도와드릴게요. 예: '3일 전 신촌에서 파란 휴대폰 잃어버렸어요'"
-        elif count == 1:
-            msg = (
-                "이 서비스는 분실물 회수 지원에 집중해요. 어떤 물건을 어디서 언제쯤 잃어버렸는지 알려주시면 도와드릴게요. "
-                "예: '어제 성균관대에서 아이폰을 잃어버렸어요'"
-            )
         elif count == 2:
-            msg = (
-                "먼저 분실물 기본 정보(카테고리/날짜/장소)가 필요해요. 예: '지난주 신촌에서 백팩 잃어버렸어요' 처럼 알려주세요." )
+            msg = ("먼저 분실물 기본 정보(카테고리/날짜/장소)가 필요해요. 예: '지난주 신촌에서 백팩 잃어버렸어요' 처럼 알려주세요.")
         else:
             msg = "분실물 정보(예: 언제, 어디서, 어떤 물건)를 입력해주셔야 계속 도와드릴 수 있어요."
         return _persona_wrap(msg, 'ask'), lost_state, "intent:redirect", _snapshot(idx, current)
@@ -551,7 +622,7 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
             if matches:
                 current['external_matches'] = matches
         except Exception as e:
-            print('[external_search] confirm-stage search failed', e)
+            logger.error('external_search confirm-stage search failed err=%s', e)
             search_error = True
 
         match_count = len(matches) if matches else 0
@@ -580,7 +651,7 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
                 f"루시가 관련 있어 보이는 후보 {match_count}개를 찾았어요. 상위 일부만 먼저 보여드렸어요. "
                 "더 세밀한 단서를 주시면 결과를 더 정밀하게 좁힐 수 있어요!"
             )
-        search_msg += "\n새 분실물이 있다면 그냥 새로 설명을 시작해 주시면 돼요 (특별한 명령어 필요 없음)."
+        search_msg += "\n새 분실물이 있다면 바로 새 설명을 시작해 주시면 돼요 (특별한 명령어 필요 없음)."
         snapshot = _snapshot(idx, current)
         return (search_msg, lost_state, "lost-item-flow.v2", snapshot)
     if current.get("stage") == "ready" and intent == 'cancel':
@@ -672,7 +743,7 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
                 if cand:
                     extracted['region'] = cand
         except Exception as _e:
-            print('[extraction.region_sanitize] error', _e)
+            logger.warning('region_sanitize error=%s', _e)
         # Source tagging + conflict detection
         conflicts = current.get('conflicts') or {}
         vision_conf_map = {}
@@ -759,7 +830,7 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
             confirmation = _build_confirmation_summary(extracted)
             reply = _persona_wrap(confirmation, 'confirm')
             if not current.get("media_ids") and not current.get("asked_photo"):
-                reply += "\n\n추가로 사진이 있다면 지금 최대 3장까지 올려주세요. 없으면 그냥 계속 말씀하거나 검색 진행 의사를 자연스럽게 표현해 주세요."
+                reply += "\n\n추가로 사진이 있다면 지금 최대 3장까지 올려주세요. 없으면 계속 말씀하거나 검색 진행 의사를 자연스럽게 표현해 주세요."
                 current["asked_photo"] = True
         else:
             reply = None  # no need to say anything; allow general chat
@@ -789,7 +860,7 @@ def _snapshot(idx: int, item: Dict[str, Any]) -> Dict[str, Any]:
 def _log_metric(event: str, **fields: Any) -> None:
     ts = datetime.now().isoformat()
     compact = ' '.join(f"{k}={v}" for k, v in fields.items())
-    print(f"[metric] {ts} {event} {compact}")
+    logger.info("metric ts=%s event=%s %s", ts, event, compact)
 
 
 def _build_confirmation_summary(extracted: Dict[str, Any]) -> str:
