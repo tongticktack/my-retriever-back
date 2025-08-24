@@ -189,6 +189,45 @@ def send_message(req: SendMessageRequest):
     user_lower = req.content.strip().lower()
     # Start-new trigger keywords retained but no longer required after a confirmed search; user can just describe a new item.
     start_new_trigger = any(kw in user_lower for kw in ["또 잃어버렸", "다른 물건", "새 물건", "추가 물건"]) or user_lower.startswith("새 물건")
+    # --- 자동 새 아이템 생성 Heuristic ---
+    # 이전 active 아이템이 confirmed 상태이고 사용자가 다시 분실물 서술(장소+아이템/분실 동사/카테고리 단어 등)을 하면
+    # 별도 "새 물건" 트리거 없이도 새 아이템 시작하도록 start_new_trigger True로 승격
+    try:
+        active_idx_auto = lost_state.get("active_index")
+        active_item_auto = None
+        if active_idx_auto is not None:
+            items_list_auto = (lost_state.get("items") or [])
+            if 0 <= active_idx_auto < len(items_list_auto):
+                active_item_auto = items_list_auto[active_idx_auto]
+        active_stage = active_item_auto.get("stage") if isinstance(active_item_auto, dict) else None
+        if not start_new_trigger and active_stage == "confirmed":
+            # 간단 item-like 판별: 위치(역/터미널/구/동)+분실 동사/시간표현+카테고리 키워드
+            patterns_loc = ["역", "터미널", "공항", "구", "동", "시청", "대학교"]
+            patterns_verb = ["잃어버", "분실", "두고", "놓고", "떨어뜨렸"]
+            patterns_time = ["전", "어제", "그제", "3일", "2일", "지난주"]
+            # 카테고리/서브카테고리 토큰
+            try:
+                from app.domain import lost_item_schema as _schema  # local import to avoid cycles
+                cat_tokens = set(_schema.PRIMARY_CATEGORIES)
+                for subs in _schema.SUBCATEGORIES.values():
+                    for s in subs:
+                        cat_tokens.add(s)
+            except Exception:
+                cat_tokens = set()
+            has_cat_token = any(t for t in cat_tokens if t and t.lower() in user_lower)
+            loc_hint = any(p in user_lower for p in patterns_loc)
+            verb_hint = any(p in user_lower for p in patterns_verb)
+            time_hint = any(p in user_lower for p in patterns_time)
+            # 부정/확인/잡담 제외 간단 필터
+            ignore_tokens = ["고마워", "감사", "확인", "끝", "맞아"]
+            if not any(it in user_lower for it in ignore_tokens):
+                # 핵심 조건: (verb 또는 time) + (loc 또는 cat)
+                if (verb_hint or time_hint) and (loc_hint or has_cat_token):
+                    start_new_trigger = True
+                    logger.info("auto_new_item_trigger session=%s reason=heuristic verb=%s time=%s loc=%s cat=%s msg=%r", 
+                                req.session_id, verb_hint, time_hint, loc_hint, has_cat_token, req.content[:120])
+    except Exception as _auto_e:
+        logger.debug("auto_new_item_trigger_error session=%s err=%s", req.session_id, _auto_e)
 
     # 최초 이미지-only 메시지인 경우 (텍스트 없음 & 아직 active item 없음) 선행 아이템 생성하여 media_ids 보존
     if user_meta and user_meta.get("attachments") and not safe_content.strip() and (lost_state.get("active_index") is None):
@@ -576,19 +615,33 @@ def send_message(req: SendMessageRequest):
             assistant_reply = ack_line + "\n" + assistant_reply
         else:
             assistant_reply = ack_line
-    chat_store.update_session(req.session_id, {"lost_items": lost_state})
+    # Persist only newly added items (append-only) instead of rewriting entire array each turn
     try:
         session_user = session_doc.get("user_id") if session_doc else None
         user_for_items = (req.user_id or session_user or "guest")
-        # Ensure is_found flag exists (default False)
-        norm_items = []
-        for it in lost_state.get("items", []):
+        new_saved = 0
+        for it in (lost_state.get("items") or []):
+            if not isinstance(it, dict):
+                continue
+            if it.get("_saved"):
+                continue  # already persisted
             if "is_found" not in it:
                 it["is_found"] = False
-            norm_items.append(it)
-        lost_item_store.bulk_upsert(user_for_items, norm_items)
+            try:
+                saved_payload = lost_item_store.append_item(user_for_items, it)
+                # reflect assigned id/index back into session state
+                it["id"] = saved_payload.get("id")
+                it["item_index"] = saved_payload.get("item_index")
+                it["_saved"] = True
+                new_saved += 1
+            except Exception as _sv_e:
+                logger.error("lost_item_append_error session=%s err=%s", req.session_id, _sv_e)
+        if new_saved:
+            logger.info("lost_item.append session=%s user=%s new_saved=%d total_items=%d", req.session_id, user_for_items, new_saved, len(lost_state.get('items') or []))
     except Exception as e:
-        logger.error("bulk_upsert error=%s", e)
+        logger.error("lost_item_persist_block_error=%s", e)
+    # Update session after persistence so that _saved flags & ids survive
+    chat_store.update_session(req.session_id, {"lost_items": lost_state})
 
     if assistant_reply is None:
         llm = get_llm()

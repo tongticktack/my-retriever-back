@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Dict, List, Optional
 from datetime import datetime, timezone
-import random
+import uuid
 from . import chat_store  # reuse Firestore client
 from app.scripts.logging_config import get_logger
 
@@ -13,8 +13,8 @@ def _collection():
 
 
 
-def upsert_lost_item(user_id: str, item_index: int, item: Dict):
-    """Update items array in user_id doc; create if missing."""
+def append_item(user_id: str, item: Dict) -> Dict:
+    """Always append a new lost item. Ignores any incoming item_index; assigns next sequential index."""
     if user_id is None:
         user_id = "guest"
     col = _collection()
@@ -26,9 +26,10 @@ def upsert_lost_item(user_id: str, item_index: int, item: Dict):
     is_found = item.get("is_found")
     if is_found is None:
         is_found = False
+    existing_id = item.get("id")
     item_payload = {
-        "item_index": item_index,
-        "id": random.uuid4().hex,
+        "item_index": -1,  # placeholder until assigned
+        "id": existing_id or uuid.uuid4().hex,
         "stage": item.get("stage"),
         "extracted": item.get("extracted") or {},
         "missing": item.get("missing") or [],
@@ -38,6 +39,7 @@ def upsert_lost_item(user_id: str, item_index: int, item: Dict):
         "updated_at": now,
     }
     if not snap.exists:
+        item_payload["item_index"] = 0
         ref.set({
             "user_id": user_id,
             "items": [item_payload],
@@ -45,38 +47,39 @@ def upsert_lost_item(user_id: str, item_index: int, item: Dict):
             "updated_at": now,
         })
         try:
-            logger.info("firestore.write op=set doc=lost_items/%s items_count=%d", user_id, 1)
+            logger.info("firestore.write op=set doc=lost_items/%s items_count=%d appended=1", user_id, 1)
         except Exception:
             pass
-    else:
-        doc = snap.to_dict() or {}
-        items = doc.get("items") or []
-        # Replace or append item by item_index
-        replaced = False
-        for idx, it in enumerate(items):
-            if it.get("item_index") == item_index:
-                items[idx] = item_payload
-                replaced = True
-                break
-        if not replaced:
-            items.append(item_payload)
-        ref.update({"items": items, "updated_at": now})
+        return item_payload
+    doc = snap.to_dict() or {}
+    items = doc.get("items") or []
+    # Assign sequential next index
+    try:
+        next_index = max(it.get("item_index", -1) for it in items) + 1 if items else 0
+    except Exception:
+        next_index = len(items)
+    item_payload["item_index"] = next_index
+    items.append(item_payload)
+    ref.update({"items": items, "updated_at": now})
+    try:
+        logger.info("firestore.write op=update doc=lost_items/%s items_count=%d appended=1", user_id, len(items))
         try:
-            logger.info(
-                "firestore.write op=update doc=lost_items/%s items_count=%d replaced=%s",
-                user_id, len(items), replaced
-            )
+            summary = [f"{it.get('item_index')}:{it.get('stage')}:{(it.get('id') or '')[:6]}" for it in items]
+            logger.debug("lost_item_store.items_summary user=%s items=%s", user_id, summary)
         except Exception:
             pass
+    except Exception:
+        pass
+    return item_payload
 
 
 
-def bulk_upsert(user_id: str, items: List[Dict]):
-    for idx, it in enumerate(items):
+def append_many(user_id: str, items: List[Dict]):
+    for it in items:
         try:
-            upsert_lost_item(user_id, idx, it)
+            append_item(user_id, it)
         except Exception as e:
-            print(f"[lost_item_store] upsert failed idx={idx}: {e}")
+            print(f"[lost_item_store] append failed: {e}")
 
 
 
