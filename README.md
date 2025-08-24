@@ -221,3 +221,27 @@ python -m app.scripts.install_cron \
 - 구독 해지(알림 옵트아웃) 필드 추가
 - 실패 재시도 & 메트릭(exporter) 연동
 
+
+공공데이터 api -> firestore
+
+Firebase CLI 로그인:
+
+  터미널에서 명령어를 실행, 웹 브라우저에서 본인의 Google 계정으로 로그인
+
+    firebase login
+
+Firebase 프로젝트 연결 확인:
+
+  프로젝트에 정상적으로 접근 가능한지 확인
+
+    firebase projects:list
+
+      firebase 프로젝트 권한을 드려서 myretriver-c5fdd 프로젝트가 있어야 합니다.
+
+필요한 라이브러리 설치:
+
+  데이터 수집기(firebase_function/functions)에 필요한 라이브러리를 설치
+
+    cd firebase_function/functions
+
+      npm install
