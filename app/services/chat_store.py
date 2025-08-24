@@ -92,6 +92,10 @@ def add_message(session_id: str, role: str, content: str, meta: Optional[Dict] =
     snap = session_ref.get()
     if not snap.exists:
         raise ValueError("session_not_found")
+    try:
+        logger.info("firestore.query op=get doc=chat_sessions/%s", session_id)
+    except Exception:
+        pass
 
     server_ts = firestore.SERVER_TIMESTAMP
     # 메시지 작성
@@ -105,6 +109,10 @@ def add_message(session_id: str, role: str, content: str, meta: Optional[Dict] =
             if k not in payload:
                 payload[k] = v
     msg_ref.set(payload)
+    try:
+        logger.info("firestore.write op=set doc=chat_sessions/%s/messages/%s role=%s len=%d", session_id, msg_id, role, len(trimmed))
+    except Exception:
+        pass
     # 마지막 활동 시각 + (필요 시) 타이틀 업데이트
     updates = {"last_active_at": server_ts}
     # 첫 user 메시지일 때 title 설정
@@ -125,6 +133,10 @@ def add_message(session_id: str, role: str, content: str, meta: Optional[Dict] =
             # 실패 시 title 생략 (None 유지)
             pass
     session_ref.update(updates)
+    try:
+        logger.info("firestore.write op=update doc=chat_sessions/%s fields=%s", session_id, list(updates.keys()))
+    except Exception:
+        pass
     return msg_id
 
 
@@ -136,6 +148,10 @@ def fetch_messages(session_id: str, limit: int = 50) -> List[Dict]:
     docs = (session_ref.collection("messages")
             .order_by("created_at", direction=firestore.Query.DESCENDING)
             .limit(limit).stream())
+    try:
+        logger.info("firestore.query op=list collection=chat_sessions/%s/messages order_by=created_at desc limit=%d", session_id, limit)
+    except Exception:
+        pass
     messages = []
     for d in docs:
         data = d.to_dict() or {}
@@ -175,11 +191,19 @@ def list_sessions(user_id: str, limit: int = 50) -> List[Dict]:
     # We'll fetch up to 3x limit docs (user typically has few sessions) then sort in memory.
     try:
         from google.cloud.firestore_v1 import FieldFilter  # type: ignore
-    base_query = col.where(filter=FieldFilter("user_id", "==", user_id))
-    logger.debug("query.base FieldFilter")
+        base_query = col.where(filter=FieldFilter("user_id", "==", user_id))
+        logger.debug("query.base FieldFilter")
+        try:
+            logger.info("firestore.query op=query collection=chat_sessions filter=user_id==%s limit~%d", user_id, limit)
+        except Exception:
+            pass
     except Exception as e:
         logger.warning("FieldFilter unavailable fallback type=%s msg=%s", type(e).__name__, e)
         base_query = col.where("user_id", "==", user_id)
+        try:
+            logger.info("firestore.query op=query collection=chat_sessions filter=user_id==%s(limit~%d) mode=fallback", user_id, limit)
+        except Exception:
+            pass
     sessions: List[Dict] = []
     from google.api_core import exceptions as _gexc  # type: ignore
     import time as _time
@@ -189,6 +213,10 @@ def list_sessions(user_id: str, limit: int = 50) -> List[Dict]:
         # Probe existence quickly (single doc); if empty short return
         try:
             probe_iter = base_query.limit(1).stream()
+            try:
+                logger.info("firestore.query op=probe collection=chat_sessions filter=user_id==%s limit=1", user_id)
+            except Exception:
+                pass
             probe_first = list(probe_iter)
             if not probe_first:
                 logger.info("probe.empty user=%s", user_id)
@@ -245,7 +273,7 @@ def list_sessions(user_id: str, limit: int = 50) -> List[Dict]:
             })
     except _gexc.FailedPrecondition as e:
         # Likely missing composite index (user_id + last_active_at). Fallback: simple where only.
-    logger.warning("primary query requires index fallback detail=%s", e.message[:140] if hasattr(e,'message') else e)
+        logger.warning("primary query requires index fallback detail=%s", e.message[:140] if hasattr(e,'message') else e)
         try:
             simple_q = col.where("user_id", "==", user_id).limit(limit)
             for doc in simple_q.stream():

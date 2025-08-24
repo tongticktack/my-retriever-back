@@ -190,31 +190,54 @@ def calculate_category_subcategory_score(item_category: str, search_category: st
         return 0.0
     
     item_cat_lower = item_category.lower().strip()
+    # 분해: '전자기기 > 무선이어폰' 형태 지원
+    # 구분자: >, /, |, ,
+    raw_tokens = [t.strip() for t in re.split(r"[>/|]", item_cat_lower) if t.strip()]
+    # 토큰 첫 요소가 대분류일 가능성 높음
     
     # 1. Category 매칭 점수
     category_score = 0.0
     expanded_categories, target_subcategories = expand_search_terms_with_subcategory(search_category, search_subcategory)
     
-    # 카테고리 직접 매칭
-    if item_cat_lower == search_category.lower().strip():
-        category_score = 1.0
+    search_cat_norm = search_category.lower().strip()
+    # 1) 정확/토큰 매칭 + (옵션) subcategory 토큰까지 모두 존재
+    if search_subcategory:
+        sub_norm = search_subcategory.lower().strip()
+        # full path 토큰이 모두 존재하면 완전 일치로 1.0
+        if (search_cat_norm in raw_tokens or item_cat_lower == search_cat_norm or any(search_cat_norm == t for t in raw_tokens)) \
+           and (sub_norm in raw_tokens or sub_norm in item_cat_lower):
+            category_score = 1.0
+        else:
+            # 아직 완전 일치 아님 → 기본 카테고리 매칭 탐색
+            if item_cat_lower == search_cat_norm or search_cat_norm in raw_tokens:
+                category_score = 0.9
+            else:
+                for exp_cat in expanded_categories:
+                    if exp_cat and exp_cat in item_cat_lower:
+                        category_score = 0.8
+                        break
+            # subcategory 미포함 패널티 (카테고리만 맞고 sub 없음)
+            if category_score >= 0.8 and sub_norm not in item_cat_lower and sub_norm not in raw_tokens:
+                category_score -= 0.1  # 0.7~0.8 수준으로 하향
     else:
-        # 동의어 매칭
-        for exp_cat in expanded_categories:
-            if exp_cat and exp_cat in item_cat_lower:
-                category_score = 0.8
-                break
+        # subcategory 미지정 케이스: 기존 로직 유지
+        if item_cat_lower == search_cat_norm or search_cat_norm in raw_tokens:
+            category_score = 1.0
+        else:
+            for exp_cat in expanded_categories:
+                if exp_cat and exp_cat in item_cat_lower:
+                    category_score = 0.8
+                    break
     
     # 2. Subcategory 고려
     if search_subcategory and category_score > 0:
-        # subcategory가 있는 경우, 해당 category 내에서 더 정확한 매칭을 위한 보너스
-        # 실제 DB에는 subcategory 필드가 없으므로, category 매칭이 정확하면 보너스 점수
-        
-        # subcategory에서 추론한 category와 검색 category가 일치하는지 확인
-        inferred_category = get_category_from_subcategory(search_subcategory)
-        if inferred_category and inferred_category.lower() == search_category.lower():
-            # subcategory 정보가 일관성 있게 제공된 경우 보너스
+        # subcategory 토큰이 path 내에 존재하는 경우 추가 보너스 (최대 1.0 cap)
+        sub_norm = search_subcategory.lower().strip()
+        if sub_norm in item_cat_lower or sub_norm in raw_tokens:
             category_score = min(category_score + 0.1, 1.0)
+        else:
+            # 이미 위에서 패널티 반영했으므로 추가 조정 없음
+            pass
     
     return category_score
 

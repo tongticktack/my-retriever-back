@@ -53,8 +53,7 @@ COLLECTIONS = ["PoliceLostItem", "PortalLostItem"]
 
 ## 색상 관련 요소 제거 (COLOR_SET 등)
 
-DATE_WINDOW = 3  # ±3 days retrieval window
-MAX_DOCS_PER_DAY_PER_COLLECTION = 60  # per day cap per collection within window
+MAX_DOCS_PER_COLLECTION = 350  # category prefix + exact date 조회 최대 개수
 
 _DATE_RE = re.compile(r"^20\d{2}-\d{2}-\d{2}$")
 
@@ -111,7 +110,7 @@ def _score(doc: Dict, extracted: Dict, place_query: str | None) -> Tuple[float, 
     return score, comp
 
 def _query_candidates(collection: str, extracted: Dict) -> List[Dict]:
-    """Fetch candidates by (category prefix + foundDate within ±DATE_WINDOW days)."""
+    """Fetch candidates by (category prefix + exact lost_date)."""
     try:
         db = chat_store.get_db()
     except Exception:
@@ -119,30 +118,33 @@ def _query_candidates(collection: str, extracted: Dict) -> List[Dict]:
     col = db.collection(collection)
     want_cat = extracted.get('category')
     want_date = extracted.get('lost_date')
+    if not want_cat or not want_date or not _DATE_RE.match(want_date):
+        return []
     docs: Dict[str, Dict] = {}
-    if want_cat and want_date and _DATE_RE.match(want_date):
+    try:
         try:
-            base_date = datetime.strptime(want_date, '%Y-%m-%d').date()
+            logger.info(
+                "firestore.query op=find collection=%s cat_prefix=%s date=%s range=[%s,%s) limit=%d exact_date=1",
+                collection, want_cat, want_date, f"{want_cat}", f"{want_cat}~", MAX_DOCS_PER_COLLECTION
+            )
         except Exception:
-            base_date = None
-        if base_date:
-            for offset in range(-DATE_WINDOW, DATE_WINDOW + 1):
-                day = (base_date).fromordinal(base_date.toordinal() + offset).isoformat()
-                try:
-                    q = col.where('itemCategory', '>=', f"{want_cat}") \
-                            .where('itemCategory', '<', f"{want_cat}~")
-                    q = q.where('foundDate', '==', day).limit(MAX_DOCS_PER_DAY_PER_COLLECTION)
-                    for snap in q.stream():
-                        if snap.id not in docs:
-                            d = snap.to_dict() or {}
-                            d['atcId'] = snap.id
-                            d['collection'] = collection
-                            docs[snap.id] = d
-                except Exception as e:
-                    logger.error("date_window_query_error collection=%s day=%s err=%s", collection, day, e)
+            pass
+        q = (col.where('itemCategory', '>=', f"{want_cat}")
+                .where('itemCategory', '<', f"{want_cat}~")
+                .where('foundDate', '==', want_date)
+                .limit(MAX_DOCS_PER_COLLECTION))
+        for snap in q.stream():
+            if snap.id not in docs:
+                d = snap.to_dict() or {}
+                d['atcId'] = snap.id
+                d['collection'] = collection
+                docs[snap.id] = d
+    except Exception as e:
+        logger.error("category_date_query_error collection=%s date=%s err=%s", collection, want_date, e)
     return list(docs.values())
 
 def approximate_external_matches(extracted: Dict, place_query: str | None = None, max_results: int = 10) -> List[Dict]:
+    # 다시 날짜 필수 (exact date 조회) - lost_date 없으면 검색 안 함
     if not extracted or not extracted.get('category') or not extracted.get('lost_date'):
         return []
     # If caller omitted place_query explicitly, fall back to extracted region field
@@ -152,7 +154,7 @@ def approximate_external_matches(extracted: Dict, place_query: str | None = None
     if place_query:
         pq_norm = str(place_query).strip().lower()
         place_query = pq_norm if len(pq_norm) >= 2 else None
-    logger.info("start category=%s sub=%s date=%s place_query=%s max=%s", extracted.get('category'), extracted.get('subcategory'), extracted.get('lost_date'), place_query, max_results)
+    logger.info("start category=%s sub=%s date=%s place_query=%s max=%s exact_date=1", extracted.get('category'), extracted.get('subcategory'), extracted.get('lost_date'), place_query, max_results)
     all_docs: List[Dict] = []
     for coll in COLLECTIONS:
         before = len(all_docs)

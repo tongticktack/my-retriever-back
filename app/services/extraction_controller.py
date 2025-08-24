@@ -648,10 +648,9 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
             )
         else:
             search_msg = (
-                f"루시가 관련 있어 보이는 후보 {match_count}개를 찾았어요. 상위 일부만 먼저 보여드렸어요. "
-                "더 세밀한 단서를 주시면 결과를 더 정밀하게 좁힐 수 있어요!"
+                f"루시가 관련 있어 보이는 후보 {match_count}개를 찾았어요. 상위 후보들을 보여드렸어요. "
             )
-        search_msg += "\n새 분실물이 있다면 바로 새 설명을 시작해 주시면 돼요 (특별한 명령어 필요 없음)."
+        search_msg += "\n새 분실물이 있다면 바로 새 설명을 시작해 주시면 돼요."
         snapshot = _snapshot(idx, current)
         return (search_msg, lost_state, "lost-item-flow.v2", snapshot)
     if current.get("stage") == "ready" and intent == 'cancel':
@@ -720,23 +719,32 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
             reg_val = extracted.get('region')
             if reg_val and reg_val in REL_DATE:
                 extracted.pop('region', None)
-            if not extracted.get('region'):
-                # Attempt to recover place from user_text tokens
-                import re as _re
-                tokens = _re.split(r"\s+", user_text.strip())
+            # Always scan tokens for explicit '...에서' pattern -> force region override
+            import re as _re
+            tokens = _re.split(r"\s+", user_text.strip())
+            forced = None
+            for t in tokens:
+                m2 = _re.match(r"^(.+?)에서$", t)
+                if m2:
+                    base = m2.group(1).strip(',.!?')
+                    if 1 <= len(base) <= 15 and base not in REL_DATE:
+                        forced = base
+                        break
+            if forced:
+                extracted['region'] = forced
+            elif not extracted.get('region'):
+                # Fallback heuristic if no forced form; also consider tokens ending with '에'
                 cand = None
                 for t in tokens:
                     base = t
                     m = _re.match(r"(.+?)(?:에서|에)$", t)
                     if m:
                         base = m.group(1)
-                        # Treat anything that had '에서' suffix as a location candidate directly if length ok
                         if 2 <= len(base) <= 15 and base not in REL_DATE:
                             cand = base
                             break
                     if len(base) < 2 or len(base) > 15:
                         continue
-                    # Heuristic: ends with typical location suffix OR in gazetteer list
                     if base.endswith(("역","구","동","터미널","공항")) or base in {"종로","강남","신촌","홍대","잠실","건대","인천공항"}:
                         cand = base
                         break
@@ -875,7 +883,9 @@ def _build_confirmation_summary(extracted: Dict[str, Any]) -> str:
     if reg: parts.append(f"장소: {reg}")
     if not parts:
         return "정보 정리 중입니다."
-    return "확인해주세요:\n" + "\n".join(f"- {p}" for p in parts) + "\n수정할 내용이 있으면 바로 적어주시고, 괜찮으면 계속 진행 의사를 자연스럽게 표현해주세요."
+    bullets = "\n".join(f"- {p}" for p in parts)
+    # 두 줄 공백으로 불릿과 후속 안내 문단 시각적 분리
+    return "확인해주세요:\n\n" + bullets + "\n\n" + "수정할 내용이 있으면 바로 적어주시고, 괜찮으면 계속 진행 의사를 자연스럽게 표현해주세요."
 
 
 def _guess_field(extracted: Dict[str, str], field: str) -> str | None:  # pragma: no cover (LLM)

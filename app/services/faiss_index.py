@@ -178,25 +178,20 @@ def search_image(query_vec, k: int = 5) -> List[Tuple[str, float, dict]]:
 
     scores, idxs = IMAGE_INDEX.search(q, k)
     logger.info("faiss_search k=%d ntotal=%d returned=%d", k, ntotal, len(idxs[0]))
-        out: List[Tuple[str, float, dict]] = []
-        rank = 0
-        for score, idx in zip(scores[0], idxs[0]):
-            if idx == -1:
-                continue
-            if idx >= len(IDMAP_IMAGE):
-                # 불일치 방어
-                continue
-            item_id = IDMAP_IMAGE[idx]
-            meta = META.get(item_id, {})
-            out.append((item_id, float(score), meta))
-            logger.info("faiss_hit rank=%d item=%s score=%.4f", rank, item_id, float(score))
-            rank += 1
-        return out
-
-
-def search_text(*_args, **_kwargs):
-    """유지: 기존 API 호환(항상 빈 결과)."""
-    return []
+    out: List[Tuple[str, float, dict]] = []
+    rank = 0
+    for score, idx in zip(scores[0], idxs[0]):
+        if idx == -1:
+            continue
+        if idx >= len(IDMAP_IMAGE):
+            # 불일치 방어
+            continue
+        item_id = IDMAP_IMAGE[idx]  
+        meta = META.get(item_id, {})
+        out.append((item_id, float(score), meta))
+        logger.info("faiss_hit rank=%d item=%s score=%.4f", rank, item_id, float(score))
+        rank += 1
+    return out
 
 
 def needs_reindex(current_version: str, provider: str) -> bool:

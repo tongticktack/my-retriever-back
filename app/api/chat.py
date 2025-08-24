@@ -2,6 +2,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, date
+import re
+import unicodedata
 
 from app.services import chat_store
 from app.services.llm_providers import get_llm
@@ -116,6 +118,10 @@ def send_message(req: SendMessageRequest):
             raise HTTPException(status_code=400, detail="invalid_media_id")
         if medias:
             user_meta = {"attachments": medias}
+            try:
+                logger.info("chat.attachments received count=%d media_ids=%s", len(medias), [m.get("media_id") for m in medias])
+            except Exception:
+                pass
     # 이미지 전용 메시지 허용: content 비어있고 media_ids 존재하면 내부적으로 빈 문자열 저장
     safe_content = (req.content or "")
     try:
@@ -141,6 +147,7 @@ def send_message(req: SendMessageRequest):
     if "_img_cache" not in lost_state:
         lost_state["_img_cache"] = {}
     image_search_results = None
+    image_cached_used = False  # cached media_ids 활용 여부
     # (색상 추출 기능 비활성화 상태)
     multi_image_conflict = False
     if user_meta and user_meta.get("attachments"):
@@ -199,6 +206,10 @@ def send_message(req: SendMessageRequest):
     image_urls = None
     if user_meta and user_meta.get("attachments"):
         image_urls = [a.get("url") for a in user_meta.get("attachments") if a.get("url")]
+    # Initialize correction flags (used later for metadata)
+    ear_correction_applied = False
+    skip_post_category_correction = False  # early override 시 중복 사후 교정 패스
+    ear_correction_prev = None
     if multi_image_conflict:
         assistant_reply = (
             "여러 이미지가 서로 다른 물건으로 보입니다. 한 번에 하나의 분실물 이미지(최대 3장: 같은 물건 다른 각도)만 첨부해주세요. "
@@ -209,36 +220,216 @@ def send_message(req: SendMessageRequest):
     else:
         from time import time as _t
         _t0 = _t()
-        assistant_reply, lost_state, chosen_model, active_item_snapshot = extc.process_message(
-            req.content, lost_state, start_new_trigger, image_urls=image_urls
-        )
+        # ---- 휴대폰 vs 무선이어폰 오분류 방지 입력 강화 ----
+        augmented_text = req.content
+        # earphone token detection flags propagated for post-extraction correction
+        ear_has_ear = False
+        ear_has_phone = False
+        if augmented_text:
+            try:
+                ear_tokens = ["무선이어폰","에어팟","에어팟프로","버즈","갤럭시버즈","이어폰","이어버드","이어버즈"]
+                phone_tokens = ["휴대폰","핸드폰","스마트폰","폰","모바일","아이폰","갤럭시"]
+                low = augmented_text.lower()
+                nfkc = unicodedata.normalize('NFKC', low)
+                compact = re.sub(r"[\s\u200b\u200c\u200d]+", "", nfkc)
+                def _contains_any(tokens, *surfaces):
+                    for t in tokens:
+                        for s in surfaces:
+                            if t in s:
+                                return True
+                    return False
+                has_ear = _contains_any(ear_tokens, low, nfkc, compact)
+                has_phone = _contains_any(phone_tokens, low, nfkc, compact)
+                ear_has_ear = has_ear
+                ear_has_phone = has_phone
+                logger.info("ear_hint_check session=%s has_ear=%s has_phone=%s raw=%r compact=%r", req.session_id, has_ear, has_phone, augmented_text[:120], compact[:120])
+                if has_ear:
+                    # 휴대폰 토큰 존재 여부와 무관하게 무선이어폰 힌트 항상 주입 (휴대폰 토큰이 있어도 이어폰 우선 판단 유도)
+                    hint_text = "(참고: 대상 물품은 무선이어폰이며 휴대폰 본체가 아닌 이어폰입니다)"
+                    if hint_text not in augmented_text:
+                        augmented_text = augmented_text + "\n" + hint_text
+                    logger.info("chat.earphone_hint_injected session=%s len=%d has_phone=%s", req.session_id, len(augmented_text), has_phone)
+                else:
+                    logger.info("ear_hint_not_applied session=%s reason=no_ear_token", req.session_id)
+            except Exception as _e:
+                logger.warning("earphone_hint_error %s", _e)
+        assistant_reply, lost_state, chosen_model, active_item_snapshot = extc.process_message(augmented_text, lost_state, start_new_trigger, image_urls=image_urls)
+        # ---- EARLY EARPHONE OVERRIDE (pre-reply persistence) ----
+        try:
+            active_idx_pre = lost_state.get("active_index")
+            if active_idx_pre is not None:
+                pre_item = (lost_state.get("items") or [])[active_idx_pre]
+                if isinstance(pre_item, dict):  
+                    extracted_pre = pre_item.get("extracted") or {}
+                    pre_cat = (extracted_pre.get("category") or "").strip()
+                    pre_sub = (extracted_pre.get("subcategory") or "").strip()
+                    # 휴대폰 분류이면서 이어폰 토큰 감지된 경우 즉시 교정 (stage 무관)
+                    if pre_cat == "휴대폰" and ear_has_ear:
+                        if pre_sub in ["", "기타휴대폰", "삼성휴대폰", "LG휴대폰", "아이폰", "기타통신기기"]:
+                            prev_cat2, prev_sub2 = pre_cat, pre_sub
+                            extracted_pre["category"] = "전자기기"
+                            extracted_pre["subcategory"] = "무선이어폰"
+                            pre_item["extracted"] = extracted_pre
+                            try:
+                                pre_item["missing"] = li_ext.compute_missing(extracted_pre)
+                            except Exception:
+                                pass
+                            ear_correction_applied = True
+                            ear_correction_prev = {"category": prev_cat2, "subcategory": prev_sub2}
+                            logger.info("category_correction early_applied session=%s prev=%s/%s new=전자기기/무선이어폰", req.session_id, prev_cat2, prev_sub2)
+                            # 표준 요약 재생성 (중복 제거 & 순서 통일)
+                            try:
+                                orig_reply_backup = assistant_reply or ""
+                                orig_lines = [l.strip() for l in orig_reply_backup.splitlines() if l.strip()]
+                                # 표준 불릿 구성
+                                bullet_lines = ["- 종류: 전자기기 (무선이어폰)"]
+                                if extracted_pre.get('lost_date'):
+                                    bullet_lines.append(f"- 날짜: {extracted_pre.get('lost_date')}")
+                                if extracted_pre.get('region'):
+                                    bullet_lines.append(f"- 장소: {extracted_pre.get('region')}")
+                                # 원본 tail 에서 유용한 문장 추출 (사진/추가특징/격려)
+                                tail_whitelist_kw = ["사진", "업로드", "특징", "도와", "찾아", "확인"]
+                                salvaged = []
+                                for ln in orig_lines:
+                                    if any(kw in ln for kw in tail_whitelist_kw) and not any(ln.startswith(pfx) for pfx in ["- 종류", "- 날짜", "- 장소", "확인해주세요"]):
+                                        if ln not in salvaged:
+                                            salvaged.append(ln)
+                                    if len(salvaged) >= 3:
+                                        break
+                                photo_line_added = any('사진' in s for s in salvaged)
+                                if not photo_line_added and not pre_item.get('media_ids'):
+                                    salvaged.append("사진이 있다면 최대 3장까지 올려주시면 더 정확하게 찾아볼게요. 🐾")
+                                # 기본 안내/마무리
+                                guidance = "수정할 부분이 있으면 편하게 말씀해 주세요. 맞다면 '확인'이라고 적어주시면 바로 다음 단계로 진행할게요."
+                                closing = "추가로 기억나는 작은 단서라도 좋으니 떠오를 때 바로 이어서 알려주세요! 🐶"
+                                body = "\n".join(bullet_lines)
+                                tail = "\n".join([guidance] + salvaged + [closing])
+                                assistant_reply = "확인해주세요:\n\n" + body + "\n\n" + tail
+                                skip_post_category_correction = True
+                            except Exception as _rebuild_e:
+                                logger.warning("early_summary_rebuild_error session=%s err=%s", req.session_id, _rebuild_e)
+                        else:
+                            logger.info("category_correction early_skip_unhandled_sub session=%s cat=%s sub=%s", req.session_id, pre_cat, pre_sub)
+        except Exception as _early_e:
+            logger.error("early_earphone_override_error session=%s err=%s", req.session_id, _early_e)
+        if not skip_post_category_correction:
+            # ---------------- 사후 교정 로직 (fallback) ----------------
+            try:
+                active_idx = lost_state.get("active_index")
+                if active_idx is not None:
+                    active_item = (lost_state.get("items") or [])[active_idx]
+                    if isinstance(active_item, dict):
+                        stage = active_item.get("stage")
+                        extracted = active_item.get("extracted") or {}
+                        cat = (extracted.get("category") or "").strip()
+                        sub = (extracted.get("subcategory") or "").strip()
+                        if cat == "휴대폰" and ear_has_ear and not ear_has_phone:
+                            if sub in ["", "기타휴대폰", "삼성휴대폰", "LG휴대폰", "아이폰", "기타통신기기"]:
+                                prev_cat, prev_sub = cat, sub
+                                extracted["category"] = "전자기기"
+                                extracted["subcategory"] = "무선이어폰"
+                                active_item["extracted"] = extracted
+                                try:
+                                    active_item["missing"] = li_ext.compute_missing(extracted)
+                                except Exception:
+                                    pass
+                                ear_correction_applied = True
+                                ear_correction_prev = {"category": prev_cat, "subcategory": prev_sub}
+                                logger.info("category_correction applied earphone session=%s prev=%s/%s new=전자기기/무선이어폰", req.session_id, prev_cat, prev_sub)
+                            else:
+                                logger.info("category_correction_skipped sub_not_in_correctable session=%s cat=%s sub=%s", req.session_id, cat, sub)
+                        else:
+                            logger.info("category_correction_not_applicable session=%s stage=%s cat=%s sub=%s ear_tokens=%s phone_tokens=%s", req.session_id, stage, cat, sub, ear_has_ear, ear_has_phone)
+                if ear_correction_applied and assistant_reply:
+                    try:
+                        orig_reply_backup = assistant_reply or ""
+                        active_idx2 = lost_state.get("active_index")
+                        extracted2 = None
+                        if active_idx2 is not None:
+                            try:
+                                extracted2 = (lost_state.get("items") or [])[active_idx2].get("extracted") or {}
+                            except Exception:
+                                extracted2 = {}
+                        bullet_lines = ["- 종류: 전자기기 (무선이어폰)"]
+                        if extracted2 and extracted2.get('lost_date'):
+                            bullet_lines.append(f"- 날짜: {extracted2.get('lost_date')}")
+                        if extracted2 and extracted2.get('region'):
+                            bullet_lines.append(f"- 장소: {extracted2.get('region')}")
+                        orig_lines = [l.strip() for l in orig_reply_backup.splitlines() if l.strip()]
+                        tail_whitelist_kw = ["사진", "업로드", "특징", "도와", "찾아", "확인"]
+                        salvaged = []
+                        for ln in orig_lines:
+                            if any(kw in ln for kw in tail_whitelist_kw) and not any(ln.startswith(pfx) for pfx in ["- 종류", "- 날짜", "- 장소", "확인해주세요"]):
+                                if ln not in salvaged:
+                                    salvaged.append(ln)
+                            if len(salvaged) >= 3:
+                                break
+                        photo_line_added = any('사진' in s for s in salvaged)
+                        if not photo_line_added and not ((lost_state.get('items') or [])[active_idx2] or {}).get('media_ids'):
+                            salvaged.append("사진이 있다면 최대 3장까지 올려주시면 더 잘 도와드릴 수 있어요. 🐾")
+                        guidance = "수정할 부분이 있으면 편하게 말씀해 주세요. 맞다면 '확인'이라고 적어주시면 다음 단계로 넘어갈게요."
+                        closing = "작은 단서라도 좋으니 계속 떠오르면 편하게 이어서 알려주세요! 🐶"
+                        body = "\n".join(bullet_lines)
+                        tail = "\n".join([guidance] + salvaged + [closing])
+                        assistant_reply = "확인해주세요:\n\n" + body + "\n\n" + tail
+                        logger.info("category_correction_summary_rebuilt session=%s (fallback)", req.session_id)
+                    except Exception as _re2:
+                        logger.warning("category_correction_reply_rewrite_error session=%s error=%s", req.session_id, _re2)
+            except Exception as _ce:
+                logger.error("category_correction_error session=%s error=%s", req.session_id, _ce)
     logger.info("extraction_controller latency=%.2fs model=%s reply_len=%d", (_t() - _t0), chosen_model, len(assistant_reply) if assistant_reply else 0)
     # After extraction: run metadata-based candidate filtering + image similarity (lazy) if user supplied images
     # 이미지 검색은 confirmed 상태에서만 실행 (확인 후에만)
+    # 이미지 검색 게이트 재구성: 확인(confirmed) 이후에는 과거에 첨부한 media_ids 로도 검색 수행
     should_run_image_search = False
-    if user_meta and user_meta.get("attachments") and not multi_image_conflict:
-        active_idx = lost_state.get("active_index")
-        if active_idx is not None:
-            try:
-                current_item = (lost_state.get("items") or [])[active_idx]
-                current_stage = current_item.get("stage")
-                # confirmed 상태에서만 이미지 검색 실행
-                if current_stage == "confirmed":
-                    should_run_image_search = True
-            except Exception:
-                pass
+    active_idx_for_gate = lost_state.get("active_index")
+    current_item_for_gate = None
+    if active_idx_for_gate is not None:
+        try:
+            current_item_for_gate = (lost_state.get("items") or [])[active_idx_for_gate]
+        except Exception:
+            current_item_for_gate = None
+    current_stage = current_item_for_gate.get("stage") if isinstance(current_item_for_gate, dict) else None
+    current_attachments_count = len(user_meta.get("attachments") or []) if (user_meta and user_meta.get("attachments")) else 0
+    stored_media_ids = []
+    if isinstance(current_item_for_gate, dict):
+        stored_media_ids = list(current_item_for_gate.get("media_ids") or [])
+    has_stored_media = len(stored_media_ids) > 0
+    # confirmed && (현재 첨부 or 저장된 첨부) && conflict 아님
+    if current_stage == "confirmed" and not multi_image_conflict and (current_attachments_count > 0 or has_stored_media):
+        should_run_image_search = True
+    logger.info(
+        "image_search.gate session=%s active_idx=%s stage=%s current_attachments=%d stored_media=%d run=%s",
+        req.session_id,
+        active_idx_for_gate,
+        current_stage,
+        current_attachments_count,
+        len(stored_media_ids),
+        should_run_image_search,
+    )
+    if (current_attachments_count > 0 and current_stage != "confirmed" and not multi_image_conflict):
+        logger.info("image_search.skip stage_not_confirmed session=%s", req.session_id)
     
     if should_run_image_search and (assistant_reply is not None):
         try:
             from app.services import faiss_index as _fi
             # Build candidate id set based on extracted info (category, region)
             active_idx = lost_state.get("active_index")
-            extracted = None
+            # 안전한 active item 추출 (None 이나 비 dict 일 경우 방어)
+            extracted = {}
             if active_idx is not None:
                 try:
-                    extracted = (lost_state.get("items") or [])[active_idx].get("extracted") or {}
-                except Exception:
-                    extracted = {}
+                    items_list = (lost_state.get("items") or [])
+                    current_item_safe = items_list[active_idx] if 0 <= active_idx < len(items_list) else None
+                    if isinstance(current_item_safe, dict):
+                        extracted = current_item_safe.get("extracted") or {}
+                    else:
+                        logger.warning(
+                            "image_search.invalid_active_item session=%s idx=%s type=%s", 
+                            req.session_id, active_idx, type(current_item_safe).__name__ if current_item_safe is not None else 'None'
+                        )
+                except Exception as _safe_e:
+                    logger.error("image_search.active_item_access_error session=%s err=%s", req.session_id, _safe_e)
             cat = (extracted.get("category") or "").strip().lower() if extracted else ""
             region = (extracted.get("region") or "").strip().lower() if extracted else ""
             lost_date = _parse_iso_date(extracted.get("lost_date") if extracted else None)
@@ -246,31 +437,40 @@ def send_message(req: SendMessageRequest):
             # 1차: category/region + 날짜 윈도우(있으면)
             primary_window_ids = []
             expanded_needed = False
-            for iid, meta in _fi.META.items():
-                # Skip ephemeral session-added entries (we tagged with type)
-                if isinstance(meta, dict) and meta.get("type") in {"media","lost_item"}:
-                    continue
-                if not isinstance(meta, dict):
-                    continue
-                mcat = str(meta.get("category","")) .lower()
-                if cat and cat not in mcat:
-                    continue
-                if region:
-                    place = str(meta.get("found_place","")) .lower()
-                    if region not in place:
+            logger.info("image_search.build_candidates session=%s meta_count=%d", req.session_id, len(getattr(_fi, 'META', {})))
+            try:
+                for iid, meta in _fi.META.items():
+                    # Defensive meta validation
+                    if meta is None:
+                        logger.warning("image_search.meta_none session=%s iid=%s", req.session_id, iid)
                         continue
-                # Date filtering
-                found_raw = meta.get('found_time') or meta.get('foundDate') or meta.get('found_date')
-                found_d = _parse_iso_date(found_raw) if isinstance(found_raw, str) else None
-                if lost_date and found_d:
-                    if _within_window(found_d, lost_date, PRIMARY_DATE_WINDOW_DAYS):
-                        primary_window_ids.append(iid)
-                    elif _within_window(found_d, lost_date, EXPANDED_DATE_WINDOW_DAYS):
-                        expanded_needed = True
-                        candidates.append(iid)  # store for possible expansion
-                else:
-                    # If no date info, keep as fallback candidate list
-                    candidates.append(iid)
+                    if not isinstance(meta, dict):
+                        logger.warning("image_search.meta_not_dict session=%s iid=%s type=%s", req.session_id, iid, type(meta).__name__)
+                        continue
+                    # Skip ephemeral session-added entries (we tagged with type)
+                    if meta.get("type") in {"media","lost_item"}:
+                        continue
+                    mcat = str(meta.get("category","")) .lower()
+                    if cat and cat not in mcat:
+                        continue
+                    if region:
+                        place = str(meta.get("found_place","")) .lower()
+                        if region not in place:
+                            continue
+                    # Date filtering
+                    found_raw = meta.get('found_time') or meta.get('foundDate') or meta.get('found_date')
+                    found_d = _parse_iso_date(found_raw) if isinstance(found_raw, str) else None
+                    if lost_date and found_d:
+                        if _within_window(found_d, lost_date, PRIMARY_DATE_WINDOW_DAYS):
+                            primary_window_ids.append(iid)
+                        elif _within_window(found_d, lost_date, EXPANDED_DATE_WINDOW_DAYS):
+                            expanded_needed = True
+                            candidates.append(iid)  # store for possible expansion
+                    else:
+                        # If no date info, keep as fallback candidate list
+                        candidates.append(iid)
+            except Exception as _cand_e:
+                logger.exception("image_search.build_candidates_error session=%s err=%s", req.session_id, _cand_e)
             if lost_date:
                 if primary_window_ids:
                     candidates = primary_window_ids
@@ -282,16 +482,53 @@ def send_message(req: SendMessageRequest):
             # simple in-memory per-session cache placeholder (현재 미사용)
             best = None
             best_score = -1.0
-            atts = user_meta.get("attachments")
+            # user_meta 가 None 인 confirm-only 메시지에서도 이미지 검색이 돌 수 있으므로 방어
+            atts = (user_meta or {}).get("attachments")
+            if atts is None:
+                logger.debug("image_search.no_user_meta_attachments session=%s", req.session_id)
+            logger.info(
+                "image_search.start session=%s attachments=%d candidates=%d candidate_set=%s cat=%s region=%s lost_date=%s",
+                req.session_id,
+                len(atts or []),
+                len(candidates),
+                bool(candidate_set),
+                cat,
+                region,
+                extracted.get("lost_date") if extracted else None,
+            )
+            # attachments 우선, 없으면 stored media_ids 사용
+            if not atts:
+                # cached media ids -> dict 형태로 변환
+                atts = [{"media_id": mid} for mid in stored_media_ids][:MAX_MEDIA_PER_MESSAGE]
+                image_cached_used = True
+                logger.info("image_search.use_cached session=%s count=%d", req.session_id, len(atts))
+            # META 진단 로그 (최초 1회 수준으로 필터) - 비 dict/null 엔트리 수 파악
+            try:
+                from app.services import faiss_index as _fi  # 재참조 (위에서 import 했지만 안전)
+                total_meta = len(getattr(_fi, 'META', {}))
+                invalid_meta = sum(1 for _id,_m in _fi.META.items() if not isinstance(_m, dict))
+                logger.info("image_search.meta_stats session=%s meta_total=%d invalid=%d", req.session_id, total_meta, invalid_meta)
+            except Exception as _ms_e:
+                logger.debug("image_search.meta_stats_error session=%s err=%s", req.session_id, _ms_e)
             for idx, att in enumerate(atts[:MAX_MEDIA_PER_MESSAGE]):
                 mid = att.get("media_id")
                 if not mid:
                     continue
                 emb = media_store.get_embedding(mid)
                 if emb is None:
+                    logger.warning("image_search.embedding_missing mid=%s session=%s", mid, req.session_id)
                     continue
+                else:
+                    logger.info("image_search.embedding_ok mid=%s dim=%s", mid, getattr(emb, 'shape', None))
                 # Query broader then filter
-                raw = _fi.search_image(emb, k= max(IMAGE_SIMILARITY_TOP_K*4, IMAGE_SIMILARITY_TOP_K+10))
+                k_query = max(IMAGE_SIMILARITY_TOP_K*4, IMAGE_SIMILARITY_TOP_K+10)
+                logger.info("image_search.query mid=%s k=%d", mid, k_query)
+                raw = _fi.search_image(emb, k=k_query)
+                try:
+                    raw_dbg = [{"id": r[0], "score": round(r[1],4)} for r in raw[:15]]
+                    logger.info("image_search.raw mid=%s returned=%d top=%s", mid, len(raw), raw_dbg)
+                except Exception:
+                    logger.info("image_search.raw mid=%s returned=%d", mid, len(raw))
                 filtered = []
                 for iid, score, meta in raw:
                     if candidate_set and iid not in candidate_set:
@@ -304,9 +541,30 @@ def send_message(req: SendMessageRequest):
                 if filtered and filtered[0][1] > best_score:
                     best_score = filtered[0][1]
                     best = filtered
+                try:
+                    filt_dbg = [{"id": f[0], "score": round(f[1],4)} for f in filtered]
+                except Exception:
+                    filt_dbg = []
+                logger.info(
+                    "image_search.filtered mid=%s kept=%d top_score=%.4f items=%s",
+                    mid,
+                    len(filtered),
+                    filtered[0][1] if filtered else -1.0,
+                    filt_dbg
+                )
             image_search_results = best
+            if image_search_results:
+                logger.info(
+                    "image_search.best session=%s results=%d best_top_score=%.4f",
+                    req.session_id,
+                    len(image_search_results),
+                    image_search_results[0][1],
+                )
+            else:
+                logger.info("image_search.no_results session=%s", req.session_id)
         except Exception as e:
-            logger.error("image_search.meta error=%s", e)
+            # Include stack trace for deeper diagnosis
+            logger.exception("image_search.meta error=%s", e)
     
     # 이미지 유사도 검색 결과는 matches 필드로만 전달; 사용자 메시지에는 내부 media_id 노출 금지
     if user_meta and user_meta.get("attachments"):
@@ -408,10 +666,19 @@ def send_message(req: SendMessageRequest):
                         sub_q = (extracted.get("subcategory") or "").lower().strip()
                         region_q = (extracted.get("region") or "").lower().strip()
                         lost_date = _parse_iso_date(extracted.get("lost_date")) if extracted.get("lost_date") else None
+                        # ---- Text search debug: log query parameters ----
+                        try:
+                            logger.info(
+                                "text_search.query session=%s cat=%s sub=%s region=%s lost_date=%s primary_days=%d expanded_days=%d min_score=%.2f",
+                                req.session_id, cat_q or '-', sub_q or '-', region_q or '-', lost_date, PRIMARY_DATE_WINDOW_DAYS, EXPANDED_DATE_WINDOW_DAYS, MIN_TEXT_SEARCH_SCORE
+                            )
+                        except Exception:
+                            pass
                         expanded_categories, _target_subcats = expand_search_terms_with_subcategory(cat_q, sub_q)
                         candidates = []
                         primary = []
                         expanded = []
+                        debug_entries = []  # store per-candidate scoring info (capped)
                         for iid, meta in _fi.META.items():
                             if not isinstance(meta, dict):
                                 continue
@@ -489,6 +756,23 @@ def send_message(req: SendMessageRequest):
                                 'score': round(score, 3),
                                 'meta_ref': meta
                             })
+                        # Emit condensed debug log with top candidates
+                        try:
+                            if ranked_source:
+                                top_dbg = []
+                                for iid, score, meta, in ranked_source[:10]:
+                                    top_dbg.append({
+                                        'iid': iid,
+                                        'cat': meta.get('category'),
+                                        'place': meta.get('found_place'),
+                                        'date': meta.get('found_time'),
+                                        'score': round(score,3)
+                                    })
+                                logger.info("text_search.top session=%s count=%d items=%s", req.session_id, len(ranked_source), top_dbg)
+                            else:
+                                logger.info("text_search.top session=%s count=0", req.session_id)
+                        except Exception:
+                            pass
                         if trimmed:
                             matches = trimmed
             else:
@@ -498,7 +782,9 @@ def send_message(req: SendMessageRequest):
 
     # 이미지 기반 재랭킹 (confirmed 상태에서 이미지가 있는 경우)
     try:
-        if image_search_results and matches and user_meta and user_meta.get("attachments"):
+        if image_search_results and matches:
+            # Capture original text scores prior to re-ranking for diff logging
+            pre_scores = {m.get('atcId'): m.get('score', 0) for m in matches}
             # 이미지 유사도 스코어 맵 생성
             image_scores = {}
             for iid, score, meta in image_search_results:
@@ -520,10 +806,32 @@ def send_message(req: SendMessageRequest):
                     # 이미지 유사도가 없는 경우 패널티 적용
                     match['score'] = match.get('score', 0) * 0.3
                     match['source'] = 'text-only'
+            # 어떤 형태의 이미지 사용인지 메타 추가
+            try:
+                used_type = 'fresh' if (user_meta and user_meta.get('attachments')) else ('cached' if image_cached_used else 'unknown')
+                logger.info("image_rerank.mode session=%s type=%s", req.session_id, used_type)
+            except Exception:
+                pass
             
             # 재랭킹된 결과 정렬 후 상위 10개만 유지
             matches.sort(key=lambda x: x.get('score', 0), reverse=True)
             matches = matches[:10]
+
+            # Re-ranking diff log
+            try:
+                diffs = []
+                for m in matches:
+                    aid = m.get('atcId')
+                    diffs.append({
+                        'atcId': aid,
+                        'text_before': pre_scores.get(aid),
+                        'image_score': m.get('image_score'),
+                        'final': m.get('score'),
+                        'source': m.get('source')
+                    })
+                logger.info("image_rerank.diff session=%s items=%s", req.session_id, diffs)
+            except Exception:
+                pass
 
             # meta_ref 제거 (응답에서 불필요)
             for match in matches:
@@ -564,6 +872,16 @@ def send_message(req: SendMessageRequest):
         "model": chosen_model,
         "matches": matches,  # 완전 저장
     }
+    # 사후 카테고리 교정 메타 (사용자 메시지 content 에는 알리지 않음)
+    try:
+        if 'ear_correction_applied' in locals() and ear_correction_applied:
+            assistant_meta['category_correction'] = {
+                'applied': True,
+                'previous': ear_correction_prev,
+                'final': {'category': '전자기기', 'subcategory': '무선이어폰'}
+            }
+    except Exception:
+        pass
     from datetime import datetime as _dt, timezone as _tz
     assistant_meta["matches_generated_at"] = _dt.now(_tz.utc).isoformat()
     try:

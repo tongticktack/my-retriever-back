@@ -137,6 +137,18 @@ category, subcategory, lost_date, region, brand, material, pattern, notable_feat
 예17: 텍스트 "어제나 3일 전 신촌에서 가방" + 이미지 없음 (모호 두 상대표현)
 {"category":"가방","subcategory":"기타가방","region":"신촌"}
 
+예18: 텍스트 "어제 강남역에서 에어팟 프로 오른쪽만 잃어버림" + 이미지 AirPods 한쪽 사진
+{"category":"전자기기","subcategory":"무선이어폰","lost_date":"{YESTERDAY}","region":"강남역","confidences":{"category":0.95,"subcategory":0.92}}
+
+예19: 텍스트 "아이폰은 있고 에어팟만 분실" + 이미지 AirPods
+{"category":"전자기기","subcategory":"무선이어폰","confidences":{"category":0.94,"subcategory":0.90}}
+
+예20: 텍스트 "휴대폰이랑 에어팟 중 에어팟만 없습니다" + 이미지 없음
+{"category":"전자기기","subcategory":"무선이어폰"}
+
+예21: 텍스트 "에어팟인지 휴대폰인지 잘 모르겠어요" + 이미지 없음 (모호)
+{}
+
 [FAILSAFE]
 파싱 실패/비한국어 → {}
 

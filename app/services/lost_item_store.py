@@ -1,8 +1,11 @@
 from __future__ import annotations
 from typing import Dict, List, Optional
 from datetime import datetime, timezone
-
+import random
 from . import chat_store  # reuse Firestore client
+from app.scripts.logging_config import get_logger
+
+logger = get_logger("lost_item_store")
 
 
 def _collection():
@@ -25,6 +28,7 @@ def upsert_lost_item(user_id: str, item_index: int, item: Dict):
         is_found = False
     item_payload = {
         "item_index": item_index,
+        "id": random.uuid4().hex,
         "stage": item.get("stage"),
         "extracted": item.get("extracted") or {},
         "missing": item.get("missing") or [],
@@ -40,6 +44,10 @@ def upsert_lost_item(user_id: str, item_index: int, item: Dict):
             "created_at": now,
             "updated_at": now,
         })
+        try:
+            logger.info("firestore.write op=set doc=lost_items/%s items_count=%d", user_id, 1)
+        except Exception:
+            pass
     else:
         doc = snap.to_dict() or {}
         items = doc.get("items") or []
@@ -53,6 +61,13 @@ def upsert_lost_item(user_id: str, item_index: int, item: Dict):
         if not replaced:
             items.append(item_payload)
         ref.update({"items": items, "updated_at": now})
+        try:
+            logger.info(
+                "firestore.write op=update doc=lost_items/%s items_count=%d replaced=%s",
+                user_id, len(items), replaced
+            )
+        except Exception:
+            pass
 
 
 
