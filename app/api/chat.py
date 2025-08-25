@@ -755,6 +755,7 @@ def send_message(req: SendMessageRequest):
                             if meta.get("type") in {"media","lost_item"}:
                                 continue
                             mcat = str(meta.get("category") or "").lower()
+                            m_item_name = str(meta.get("itemName") or meta.get("item_name") or meta.get("item_name_raw") or "")
                             category_match = True
                             if cat_q or sub_q:
                                 category_match = is_category_match(mcat, expanded_categories if sub_q and not cat_q else [cat_q] if cat_q else expanded_categories)
@@ -790,6 +791,27 @@ def send_message(req: SendMessageRequest):
                                 score += 0.05
                             elif not lost_date:
                                 score += 0.10
+                            # ---- itemName boosting (exact/partial) ----
+                            try:
+                                q_item = (extracted.get('itemName') or '').strip()
+                                if q_item:
+                                    # 색상 단독 제외 (프롬프트와 동일 목록)
+                                    _colors = {"빨간","빨강","파란","파랑","검정","까만","하얀","흰색","초록","초록색","녹색","노랑","노란","보라","분홍","핑크","회색","은색","금색","남색","갈색"}
+                                    if q_item not in _colors and m_item_name:
+                                        low_q = q_item.lower()
+                                        low_m = m_item_name.lower()
+                                        exact = (low_q == low_m)
+                                        partial = False
+                                        if not exact and len(low_q) >= 2:
+                                            # 부분일치: 2자 이상 substring 또는 공백 토큰 교집합
+                                            if low_q in low_m or any(t and len(t) >= 2 and t in low_m for t in low_q.split()):
+                                                partial = True
+                                        if exact:
+                                            score += 0.08  # exact boost
+                                        elif partial:
+                                            score += 0.04  # partial boost
+                            except Exception:
+                                pass
                             if score < MIN_TEXT_SEARCH_SCORE:
                                 continue
                             entry = (iid, score, meta, in_primary, in_expanded)

@@ -274,7 +274,7 @@ def _strict_llm_extract(user_text: str, current: Dict[str, str], image_urls: Opt
 
     def _clean(parsed: Dict[str, Any]) -> Dict[str, Any]:
         cleaned: Dict[str, Any] = {}
-        scalar_keys = ["category", "subcategory", "lost_date", "region", "brand", "material", "pattern"]
+        scalar_keys = ["category", "subcategory", "lost_date", "region", "itemName", "brand", "material", "pattern"]
         for k in scalar_keys:
             v = parsed.get(k)
             if isinstance(v, str):
@@ -813,6 +813,15 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
                 logger.info("category_fallback_applied no_category_detected default=기타물품/기타 text_len=%d", len(user_text))
         except Exception as _cfbe:
             logger.debug("category_fallback_error err=%s", _cfbe)
+        # itemName sanity: drop if only color adjective (간단 한국어 색상 목록)
+        try:
+            colors = {"빨간","빨강","파란","파랑","검정","까만","하얀","흰색","초록","초록색","녹색","노랑","노란","보라","분홍","핑크","회색","은색","금색","남색","갈색"}
+            iname = extracted.get("itemName")
+            if iname and iname.strip() in colors:
+                extracted.pop("itemName", None)
+                current["extracted"] = extracted
+        except Exception:
+            pass
 
     # Decide next prompt (date 후보 로직 제거)
     extracted = current.get("extracted", {})

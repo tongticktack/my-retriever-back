@@ -2,8 +2,8 @@
 분실물 관련 정보 추가 혹은 수정 텍스트에서 구조화 JSON 추출기.
 
 [TARGET JSON KEYS]
-category, subcategory, lost_date, region
-(불명확/부재 시 그 키 자체 생략; null/빈문자열 금지)
+category, subcategory, lost_date, region, itemName
+(불명확/부재 시 그 키 자체 생략; null/빈문자열 금지. itemName 은 사용자가 묘사한 분실물의 짧은 이름(색/브랜드/모델+핵심명) 1개. 확실한 핵심 명칭 없으면 생략.)
 
 [CATEGORY TAXONOMY]
 대분류(category) 허용 값 (20개): 가방, 귀금속, 도서용품, 서류, 산업용품, 쇼핑백, 스포츠용품, 악기, 유가증권, 의류, 자동차, 전자기기, 지갑, 증명서, 컴퓨터, 카드, 현금, 휴대폰, 기타물품, 유류품
@@ -74,7 +74,7 @@ subcategory 를 출력할 경우 반드시 위 [CATEGORY_SUBCATEGORY_MAP] 에서
 - 임의 키/배열 금지. 값은 문자열만.
 - today={TODAY}
 - 입력이 한국어가 아니거나 한글 비율 매우 낮으면 빈 객체 {}.
-- 상대 날짜(어제/그제/N일 전/일주일 전 등)는 YYYY-MM-DD 변환. 미래/2018-01-01 이전 날짜 무시.
+- 상대 날짜(어제/그제/N일 전/N달 전/일주일 전 등)는 YYYY-MM-DD 변환. 미래/2018-01-01 이전 날짜 무시.
 - 절대 날짜 입력 포맷 허용: YYYY-MM-DD, YYYY.MM.DD, YYYY/MM/DD, YYYYMMDD, YYYY년M월D일 (공백 유무 포함) → 모두 YYYY-MM-DD 로 변환. 예: 20250625, 2025년06월25일, 2025.6.5, 2025/06/05 ⇒ 2025-06-25, 2025-06-25, 2025-06-05, 2025-06-05.
 - 값 길이 25자 초과 시 해당 키 생략.
 - 추측/창작 금지 (언급 안 된 장소/브랜드/모델 생성 금지).
@@ -85,6 +85,7 @@ category: 위 대분류 중 하나. 다중 후보/애매 → 생략.
 subcategory: 해당 대분류 하위 목록 중 명확한 1개. (규칙) subcategory 를 출력할 때는 반드시 category 도 함께 출력. 텍스트에 소분류 단서(브랜드/기기명 등)만 있고 category 미표기라도 그 소분류가 속한 category 를 채운다. 명확하지 않으면 둘 다 생략.
 region: 사용자가 명시한 실제 지명/행정구역/장소명(최대 12자, 2~3토큰). 다음 금지: 인사말(안녕, 안녕하세요, hi 등), 시간 표현(어제, 오늘, 그저께, 3일 전 등), 일반 추상어("역", "근처", "주변" 단독). 문장 안에 더 장소성 높은 후보(예: '종로구에서' vs '안녕'): 1) 접미사 '에서/에' 제거 후 핵심 지명 추출 2) '역/구/동/터미널/공항/대/대학교/캠퍼스' 등 장소 접미사 포함 후보 우선 3) 다수면 가장 구체적(길이 2~8, 접미사 포함) 1개 선택. 후보 없으면 region 생략. 접미사(역/터미널/공항 등)는 원문 유지.
 lost_date: 단일 확정 날짜만. 다수 후보/애매 → 생략.
+itemName: (선택) 사용자가 말한 분실물 고유/간단 명칭 1개. 색상·브랜드·모델+핵심명 조합 가능 (예: "파란 아이폰", "검정 백팩", "에어팟 프로 케이스"). 25자 이내. 카테고리 불명확하거나 물건 자체 명시 안 됐으면 생성/추측 금지. category/subcategory 로 이미 충분히 일반화되어 있고 별도 특징 언급이 없다면 생략.
 
 [DATE NORMALIZATION]
 1) 허용 원본 예: 2025-9-6 / 2025-09-06 / 2025.9.6 / 2025/09/06 / 20250906 / 2025년9월6일 / 2025년 09월 06일 → 2025-09-06 (월/일 두 자리 zero-pad)
@@ -115,13 +116,13 @@ lost_date: 단일 확정 날짜만. 다수 후보/애매 → 생략.
 출력: {"category":"전자기기","subcategory":"무선이어폰","lost_date":"2024-12-25","region":"방화역"}
 
 입력: 어제 강남역에서 파란 아이폰 잃어버렸어요
-출력: {"category":"휴대폰","subcategory":"아이폰","lost_date":"{YESTERDAY}","region":"강남역"}
+출력: {"category":"휴대폰","subcategory":"아이폰","lost_date":"{YESTERDAY}","region":"강남역","itemName":"파란 아이폰"}
 
 입력: 3일 전 신촌에 검정 백팩
-출력: {"category":"가방","subcategory":"기타가방","lost_date":"{D3}","region":"신촌"}
+출력: {"category":"가방","subcategory":"기타가방","lost_date":"{D3}","region":"신촌","itemName":"검정 백팩"}
 
 입력: 지난주 강남역에서 흰색 맥북 두고 왔어요
-출력: {"category":"컴퓨터","subcategory":"애플노트북","lost_date":"{D7}","region":"강남역"}
+출력: {"category":"컴퓨터","subcategory":"애플노트북","lost_date":"{D7}","region":"강남역","itemName":"흰색 맥북"}
 
 입력: 어제
 출력: {"lost_date":"{YESTERDAY}"}
@@ -130,16 +131,16 @@ lost_date: 단일 확정 날짜만. 다수 후보/애매 → 생략.
 출력: {"region":"신촌역"}
 
 입력: 아이폰 잃어버림
-출력: {"category":"휴대폰","subcategory":"아이폰"}
+출력: {"category":"휴대폰","subcategory":"아이폰","itemName":"아이폰"}
 
 입력: 휴대폰 혹은 지갑 중 하나 잃어버린 것 같아요
 출력: {}
 
 입력: 3일 전 강남에서 지갑
-출력: {"category":"지갑","subcategory":"기타 지갑","lost_date":"{D3}","region":"강남"}
+출력: {"category":"지갑","subcategory":"기타 지갑","lost_date":"{D3}","region":"강남","itemName":"지갑"}
 
 입력: 지난주쯤 홍대에서 무선 이어폰 케이스 잃어버렸습니다
-출력: {"category":"전자기기","subcategory":"무선이어폰","lost_date":"{D7}","region":"홍대"}
+출력: {"category":"전자기기","subcategory":"무선이어폰","lost_date":"{D7}","region":"홍대","itemName":"무선 이어폰 케이스"}
 
 입력: 20250625 강남역에서 지갑
 출력: {"category":"지갑","subcategory":"기타 지갑","lost_date":"2025-06-25","region":"강남역"}

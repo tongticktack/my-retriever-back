@@ -101,10 +101,16 @@ def _score(doc: Dict, extracted: Dict, place_query: str | None) -> Tuple[float, 
         except Exception:
             pass
 
-    # storagePlace substring (place_query)
+    # storagePlace / addr substring (place_query) - either field qualifies
     if place_query:
-        sp = doc.get('storagePlace') or doc.get('addr') or ''
-        if isinstance(sp, str) and place_query in sp.lower():
+        hit_place = False
+        sp_raw = doc.get('storagePlace')
+        addr_raw = doc.get('addr')
+        if isinstance(sp_raw, str) and place_query in sp_raw.lower():
+            hit_place = True
+        elif isinstance(addr_raw, str) and place_query in addr_raw.lower():
+            hit_place = True
+        if hit_place:
             comp['place'] = 10; score += 10
 
     return score, comp
@@ -171,12 +177,33 @@ def approximate_external_matches(extracted: Dict, place_query: str | None = None
     place_filtered = False
     fallback_place = False
     if place_query:
-        tmp = [d for d in all_docs if isinstance(d.get('storagePlace'), str) and place_query in d.get('storagePlace').lower()]
+        tmp: List[Dict] = []
+        for d in all_docs:
+            sp_raw = d.get('storagePlace')
+            addr_raw = d.get('addr')
+            hit = False
+            if isinstance(sp_raw, str) and place_query in sp_raw.lower():
+                hit = True
+            elif isinstance(addr_raw, str) and place_query in addr_raw.lower():
+                hit = True
+            if hit:
+                tmp.append(d)
         if tmp:
-            filtered = tmp
-            place_filtered = True
+            filtered = tmp; place_filtered = True
         else:
             fallback_place = True  # keep original set
+            # Diagnostic sample logging (option 4)
+            try:
+                sample = []
+                for d in all_docs[:5]:
+                    sample.append({
+                        'atcId': d.get('atcId'),
+                        'storagePlace': d.get('storagePlace'),
+                        'addr': d.get('addr')
+                    })
+                logger.info("place_filter.fallback place_query=%s sample=%s", place_query, sample)
+            except Exception:
+                pass
     scored: List[Tuple[float, Dict]] = []
     for d in filtered:
         s, comp = _score(d, extracted, place_query)
