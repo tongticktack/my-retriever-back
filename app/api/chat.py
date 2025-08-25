@@ -625,6 +625,23 @@ def send_message(req: SendMessageRequest):
                 continue
             if it.get("_saved"):
                 continue  # already persisted
+            # Require both category and lost_date to persist (등록 조건)
+            extracted_fields = it.get("extracted") or {}
+            cat_ok = bool(extracted_fields.get("category"))
+            date_ok = bool(extracted_fields.get("lost_date"))
+            if not (cat_ok and date_ok):
+                # Skip persistence until mandatory fields are available
+                try:
+                    logger.info(
+                        "lost_item.skip_persist session=%s reason=missing_fields category=%s lost_date=%s stage=%s",
+                        req.session_id,
+                        extracted_fields.get("category"),
+                        extracted_fields.get("lost_date"),
+                        it.get("stage"),
+                    )
+                except Exception:
+                    pass
+                continue
             if "is_found" not in it:
                 it["is_found"] = False
             try:

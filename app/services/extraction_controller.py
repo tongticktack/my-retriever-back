@@ -799,6 +799,20 @@ def process_message(user_text: str, lost_state: Dict[str, Any], start_new: bool,
         extracted = li_ext._validate(extracted)  # type: ignore[attr-defined]
         current["extracted"] = extracted
         current["missing"] = li_ext.compute_missing(extracted)
+        # ---- Fallback default category if none extracted ----
+        try:
+            if not (extracted.get("category")):
+                # Apply default 기타물품 > 기타
+                extracted["category"] = "기타물품"
+                # Only set subcategory if not already (defensive)
+                if not extracted.get("subcategory"):
+                    extracted["subcategory"] = "기타"
+                current["extracted"] = extracted
+                current["missing"] = li_ext.compute_missing(extracted)
+                _log_metric('category.fallback', applied=1)
+                logger.info("category_fallback_applied no_category_detected default=기타물품/기타 text_len=%d", len(user_text))
+        except Exception as _cfbe:
+            logger.debug("category_fallback_error err=%s", _cfbe)
 
     # Decide next prompt (date 후보 로직 제거)
     extracted = current.get("extracted", {})

@@ -22,7 +22,7 @@ from aiohttp import ClientResponse
 from firebase_admin import credentials
 
 from app.services import chat_store, faiss_index, embeddings
-from .logging_config import indexing_logger, log_indexing_event
+from .logging_config import get_logger, log_indexing_event
 
 # Pillow (검증용)
 import io
@@ -31,6 +31,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 MIN_SIDE = 8
 
 logger = logging.getLogger(__name__)
+indexing_logger = get_logger("image_indexing")
 
 # ------------------------------------------------------------
 # 설정 상수
@@ -255,7 +256,7 @@ class EfficientImageIndexer:
     async def get_db_items_with_images(self, limit: Optional[int] = None) -> List[ItemRow]:
         """Firestore에서 이미지 URL이 있는 아이템들을 가져옴"""
         db_start_time = time.time()
-        log_indexing_event(self.logger, "db_query_start", {"collections": ["PoliceLostItem", "PortalLostItem"], "start_time": time.time()})
+        log_indexing_event("db_query_start", {"collections": ["PoliceLostItem", "PortalLostItem"], "start_time": time.time()})
 
         db = chat_store.get_db()
         all_items: List[ItemRow] = []
@@ -307,7 +308,6 @@ class EfficientImageIndexer:
 
         db_duration = time.time() - db_start_time
         log_indexing_event(
-            self.logger,
             "db_query_complete",
             {
                 "total_processed": total_count,
@@ -382,7 +382,7 @@ class EfficientImageIndexer:
 
     async def index_items_efficiently(self, limit: Optional[int] = None) -> Dict:
         start_time = time.time()
-        log_indexing_event(self.logger, "efficient_batch_start", {"limit": limit, "start_time": datetime.now().isoformat()})
+        log_indexing_event("efficient_batch_start", {"limit": limit, "start_time": datetime.now().isoformat()})
 
         # 성공 기준 limit을 맞추기 위해 넉넉히 가져오기
         fetch_limit = None
@@ -469,7 +469,7 @@ class EfficientImageIndexer:
             "fail_breakdown": dict(fail_breakdown),
             "avg_time_per_item": duration / denom,
         }
-        log_indexing_event(self.logger, "efficient_batch_complete", {"result": result, "end_time": datetime.now().isoformat()})
+        log_indexing_event("efficient_batch_complete", {"result": result, "end_time": datetime.now().isoformat()})
 
         # ✅ ProcStatus 전체 분포 로그
         logger.info("[STATUS BREAKDOWN] %s", dict(status_counter))
@@ -521,7 +521,7 @@ class EfficientImageIndexer:
             "embedding_provider": embeddings.current_provider(),
             "embedding_cache_size": len(self.embedding_cache),
         }
-        log_indexing_event(self.logger, "stats_request", stats)
+        log_indexing_event("stats_request", stats)
         return stats
 
 

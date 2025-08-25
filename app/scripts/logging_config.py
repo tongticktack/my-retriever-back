@@ -53,14 +53,11 @@ def build_dict_config(json_fmt: bool = False) -> dict:
                 "filters": ["request_id"],
             },
             "file_app": {
-                "class": "logging.handlers.TimedRotatingFileHandler",
+                "class": "logging.FileHandler",
                 "level": "INFO",
                 "formatter": "default",
                 "filters": ["request_id"],
                 "filename": str(LOG_DIR / "app.log"),
-                "when": "midnight",
-                "interval": 1,
-                "backupCount": 30,
                 "encoding": "utf-8",
             },
             "file_image_indexing": {
